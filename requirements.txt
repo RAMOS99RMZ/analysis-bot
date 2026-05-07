@@ -1,49 +1,5 @@
-# ╔══════════════════════════════════════════════════════════════╗
-# ║        Ramos Ai 360 ♾️🎖️ — requirements.txt              ║
-# ║        Python >= 3.11 Required                              ║
-# ╚══════════════════════════════════════════════════════════════╝
-
-# ── Exchange & Market Data ─────────────────────────────────────
-ccxt==4.3.93                  # OKX API connector (unified interface)
-websockets==12.0              # Live price streaming (WebSocket)
-
-# ── Async Runtime ─────────────────────────────────────────────
-asyncio-throttle==1.0.2       # Rate limiting for async API calls
-
-# ── Technical Analysis ────────────────────────────────────────
-pandas==2.2.2                 # Core dataframe engine
-           # All TA indicators (RSI, MACD, EMA, ATR, etc.)
-numpy==1.26.4                 # Numerical operations
-
-# ── HMM Market Regime Detection ───────────────────────────────
-hmmlearn==0.3.2               # Hidden Markov Model (Expert: Regime)
-scikit-learn==1.5.0           # Dependency for hmmlearn + preprocessing
-
-# ── AI Integration ────────────────────────────────────────────
-anthropic==0.28.1             # Claude / Gemini fallback AI
-groq==0.9.0                   # Grok AI (xAI) — primary AI confirmation
-google-generativeai==0.7.2    # Gemini AI — secondary confirmation
-
-# ── Database (Supabase) ───────────────────────────────────────
-supabase==2.5.3               # Supabase Python client (signal + trade logs)
-postgrest==0.16.11            # PostgREST client (used internally by supabase)
-
-# ── Telegram Notifications ────────────────────────────────────
-python-telegram-bot==21.3     # Async Telegram bot
-
-# ── Scheduling ────────────────────────────────────────────────
-APScheduler==3.10.4           # Cron-style scheduler (5m / 15m / 2h / 4h jobs)
-
-# ── Backtesting ───────────────────────────────────────────────
-vectorbt==0.26.2              # Vectorized backtesting engine
-plotly==5.22.0                # Backtest charts (used by vectorbt)
-
-# ── Environment & Config ──────────────────────────────────────
-python-dotenv==1.0.1          # Load .env secrets into os.environ
-
-# ── HTTP / Utilities ──────────────────────────────────────────
-httpx==0.27.0                 # Async HTTP client (Grok / Gemini calls)
-tenacity==8.3.0               # Retry logic with exponential backoff
-pytz==2024.1                  # Timezone handling (Silver Bullet sessions)
-python-dateutil==2.9.0        # Date parsing utilities
-loguru==0.7.2                 # Structured logging (replaces print/Logger.log)
+ccxt
+python-dotenv
+requests
+pandas
+numpy
