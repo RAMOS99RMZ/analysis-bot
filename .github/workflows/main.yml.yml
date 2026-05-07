@@ -43,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pandas-ta --no-dependencies
+          pip install https://github.com/twopirllc/pandas-ta/archive/refs/heads/development.zip --no-deps
 
       # 4. Run the bot (injects GitHub secrets as env vars)
       - name: 🚀 Run Ramos Ai 360
