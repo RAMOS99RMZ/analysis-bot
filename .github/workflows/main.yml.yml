@@ -1,64 +1,36 @@
-# .github/workflows/run_bot.yml
-# ──────────────────────────────────────────────────────────────────────────────
-# Ramos Ai 360 ♾️🎖️ — GitHub Actions 24/7 Runner
-#
-# This workflow starts the bot on a scheduled trigger (every 10 minutes as a
-# watchdog) AND on every push to main.  The bot itself runs continuously via
-# APScheduler; GitHub Actions is only needed to (re)start it if it crashes.
-#
-# For true 24/7 uptime without gaps, consider pairing this with a free-tier
-# server (Railway, Render, or a VPS).  See README_ARABIC.md Section 4.
-# ──────────────────────────────────────────────────────────────────────────────
-
-name: 🤖 Ramos Ai 360 — Live Bot
+name: 🚀 Ramos Ai 360 Bot
 
 on:
-  push:
-    branches: [main]
   schedule:
-    # Watchdog: restart every 10 minutes if the bot has exited
-    - cron: "*/10 * * * *"
-  workflow_dispatch:   # Allow manual trigger from GitHub UI
+    - cron: '*/5 * * * *' # يعمل كل 5 دقائق
+  workflow_dispatch:
 
 jobs:
-  run-bot:
-    name: Run Trading Bot
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 9      # Safety: stop before next cron tick (avoid overlap)
-
     steps:
-      # 1. Checkout code
-      - name: ⬇️ Checkout repository
-        uses: actions/checkout@v4
+      - name: 📂 Checkout Code
+        uses: actions/checkout@v3
 
-      # 2. Set up Python 3.11
-      - name: 🐍 Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: '3.10' # نستخدم 3.10 لأنها الأكثر استقراراً مع المكتبات المالية
 
-      # 3. Install dependencies
       - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy ccxt python-dotenv requests anthropic groq google-generativeai supabase postgrest python-telegram-bot apscheduler loguru
-          pip install https://github.com/twopirllc/pandas-ta/archive/refs/heads/main.zip
-          
-      # 4. Run the bot (injects GitHub secrets as env vars)
+          pip install -r requirements.txt
+          # التثبيت السحري لـ pandas-ta لتجنب صراع النسخ
+          pip install --no-cache-dir pandas-ta
+
       - name: 🚀 Run Ramos Ai 360
         env:
-          OKX_KEY:       ${{ secrets.OKX_KEY }}
-          OKX_SECRET:    ${{ secrets.OKX_SECRET }}
-          OKX_PASS:      ${{ secrets.OKX_PASS }}
-          BOT_TOKEN:     ${{ secrets.BOT_TOKEN }}
-          CHAT_ID:       ${{ secrets.CHAT_ID }}
-          GROQ_KEY:      ${{ secrets.GROQ_KEY }}
-          GEMINI_KEY:    ${{ secrets.GEMINI_KEY }}
-          SUPABASE_URL:  ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY:  ${{ secrets.SUPABASE_KEY }}
-          LOG_LEVEL:     "INFO"
-        run: |
-          timeout 480 python main.py || true
-          # 480 seconds = 8 minutes (within the 9-minute job timeout)
-          # "|| true" prevents GitHub from marking the run as failed on timeout
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python main.py
