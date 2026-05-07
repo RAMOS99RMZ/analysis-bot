@@ -42,8 +42,8 @@ jobs:
       - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy ccxt python-dotenv requests  # تثبيت المكتبات الأساسية بدون pandas-ta
-          pip install "pandas_ta" --no-deps || pip install "pandas-ta" --no-deps || echo "Skip error"
+          pip install ccxt websockets asyncio-throttle pandas numpy hmmlearn scikit-learn anthropic groq google-generativeai supabase postgrest python-telegram-bot apscheduler loguru
+          pip install pandas-ta --no-deps
           
       # 4. Run the bot (injects GitHub secrets as env vars)
       - name: 🚀 Run Ramos Ai 360
