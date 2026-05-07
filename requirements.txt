@@ -12,7 +12,7 @@ asyncio-throttle==1.0.2       # Rate limiting for async API calls
 
 # ── Technical Analysis ────────────────────────────────────────
 pandas==2.2.2                 # Core dataframe engine
-pandas-ta==0.3.14b0           # All TA indicators (RSI, MACD, EMA, ATR, etc.)
+           # All TA indicators (RSI, MACD, EMA, ATR, etc.)
 numpy==1.26.4                 # Numerical operations
 
 # ── HMM Market Regime Detection ───────────────────────────────
