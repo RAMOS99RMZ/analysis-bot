@@ -1,57 +1,39 @@
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  .github/workflows/main.yml                                               ║
-# ║  Ramos Ai 360 ♾️🎖️ — GitHub Actions Runner (FIXED)                      ║
-# ║                                                                            ║
-# ║  🔧 الإصلاحات:                                                             ║
-# ║     1. تثبيت pandas 1.5.3 بدلاً من 2.x (حل مشكلة pandas-ta)            ║
-# ║     2. ربط أسماء الـ Secrets الصحيحة (OKX_API_KEY → OKX_KEY إلخ)       ║
-# ║     3. ترقية pip قبل التثبيت لتجنب أخطاء الحزم القديمة                  ║
-# ║     4. pip cache مضبوط بشكل صحيح لتسريع الـ runs اللاحقة               ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
 name: 🤖 Ramos Ai 360 — Live Bot
 
 on:
   push:
     branches: [main]
   schedule:
-    # كل 10 دقائق — حارس: يعيد تشغيل البوت إذا توقف
-    - cron: "*/10 * * * *"
-  workflow_dispatch: # تشغيل يدوي من واجهة GitHub
+    # كل 5 دقائق — الحد الأدنى المسموح به في GitHub Actions
+    # المستودع العام = دقائق غير محدودة ♾️
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 jobs:
   run-bot:
     name: 🚀 Run Trading Bot
     runs-on: ubuntu-latest
-    timeout-minutes: 9   # أقل من فترة الـ cron (10 دقائق) لمنع التداخل
+    timeout-minutes: 5
 
     steps:
-      # ─── 1. تنزيل الكود ─────────────────────────────────────────────────────
       - name: ⬇️ Checkout repository
         uses: actions/checkout@v4
 
-      # ─── 2. إعداد Python 3.11 ────────────────────────────────────────────────
       - name: 🐍 Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"          # GitHub يحفظ الحزم ← الـ runs اللاحقة أسرع بكثير
+          cache: "pip"
 
-      # ─── 3. تثبيت التبعيات ────────────────────────────────────────────────────
-      # الخطوة مقسومة إلى قسمين:
-      #   أ) ترقية pip أولاً (ضروري لتجنب أخطاء الحزم القديمة)
-      #   ب) تثبيت requirements.txt مرة واحدة (pandas==1.5.3 يحل مشكلة pandas-ta)
       - name: 📦 Upgrade pip
         run: python -m pip install --upgrade pip
 
-      - name: 📦 Install dependencies
-        run: |
-          pip install --no-cache-dir -r requirements.txt
-          # التحقق من أن pandas-ta تعمل بشكل صحيح
-          python -c "import pandas_ta; print('✅ pandas-ta loaded OK:', pandas_ta.version)"
+      - name: 📦 Install pandas-ta (pre-release)
+        run: pip install --pre pandas-ta
 
-      # ─── 4. التحقق السريع من الاستيراد ─────────────────────────────────────
-      # إذا فشل أي import هنا، ستعرف السبب قبل تشغيل البوت
+      - name: 📦 Install remaining dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
       - name: 🔍 Smoke test imports
         run: |
           python - <<'EOF'
@@ -59,49 +41,19 @@ jobs:
           import supabase, telegram, apscheduler
           from loguru import logger
           logger.info("✅ All core imports OK")
-          logger.info(f"   pandas  : {pandas.__version__}")
-          logger.info(f"   numpy   : {numpy.__version__}")
-          logger.info(f"   ccxt    : {ccxt.__version__}")
+          logger.info(f"   pandas-ta : {pandas_ta.version}")
           EOF
 
-      # ─── 5. تشغيل البوت (مع حقن الـ Secrets من GitHub) ─────────────────────
-      #
-      # ⚠️  ربط الأسماء:
-      #   GitHub Secret          →  اسم المتغير الذي يقرأه config.py
-      #   ─────────────────────────────────────────────────────────
-      #   OKX_API_KEY            →  OKX_KEY
-      #   OKX_SECRET_KEY         →  OKX_SECRET
-      #   OKX_PASSPHRASE         →  OKX_PASS
-      #   TELEGRAM_BOT_TOKEN     →  BOT_TOKEN
-      #   TELEGRAM_CHAT_ID       →  CHAT_ID
-      #   SUPABASE_URL           →  SUPABASE_URL   (نفس الاسم)
-      #   SUPABASE_KEY           →  SUPABASE_KEY   (نفس الاسم)
-      #   GROQ_API_KEY           →  GROQ_KEY
-      #   GEMINI_API_KEY         →  GEMINI_KEY
-      #
       - name: 🤖 Run Ramos Ai 360
         env:
-          # ── OKX ─────────────────────────────────────────────────────────────
           OKX_KEY:      ${{ secrets.OKX_API_KEY }}
           OKX_SECRET:   ${{ secrets.OKX_SECRET_KEY }}
           OKX_PASS:     ${{ secrets.OKX_PASSPHRASE }}
-
-          # ── Telegram ─────────────────────────────────────────────────────────
           BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          # ── Supabase ─────────────────────────────────────────────────────────
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-
-          # ── AI APIs (اختيارية — أضفها إلى GitHub Secrets إذا كنت تستخدمها) ──
           GROQ_KEY:     ${{ secrets.GROQ_API_KEY }}
           GEMINI_KEY:   ${{ secrets.GEMINI_API_KEY }}
-
-          # ── Misc ─────────────────────────────────────────────────────────────
           LOG_LEVEL:    "INFO"
-
-        run: |
-          # 480 ثانية = 8 دقائق (أقل من timeout-minutes: 9)
-          # || true → يمنع GitHub من تعليم الـ run فاشلاً عند انتهاء الوقت
-          timeout 480 python main.py || true
+        run: timeout 240 python main.py || true
