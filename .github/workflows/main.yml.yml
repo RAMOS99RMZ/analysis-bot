@@ -11,7 +11,7 @@ jobs:
   run-bot:
     name: 🚀 Run Trading Bot
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 9
 
     steps:
       - name: ⬇️ Checkout repository
