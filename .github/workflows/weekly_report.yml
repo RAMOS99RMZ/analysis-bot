@@ -1,0 +1,39 @@
+# .github/workflows/weekly_report.yml
+# ═══════════════════════════════════════════════════════════════
+# 📋 WEEKLY REPORT — التقرير الأسبوعي
+# كل اثنين 08:00 صباحاً UTC: عدد الصفقات + P&L + Win Rate
+# ═══════════════════════════════════════════════════════════════
+
+name: "📋 Weekly Report — Performance Summary"
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"     # كل اثنين الساعة 08:00 UTC
+  workflow_dispatch:
+
+jobs:
+  weekly_report:
+    name: "📋 Run Weekly Report"
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Bot Environment
+        uses: ./.github/actions/setup-bot
+
+      - name: 📋 Run Weekly Report
+        env:
+          OKX_KEY:      ${{ secrets.OKX_KEY }}
+          OKX_SECRET:   ${{ secrets.OKX_SECRET }}
+          OKX_PASS:     ${{ secrets.OKX_PASS }}
+          BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:      ${{ secrets.CHAT_ID }}
+          GROQ_KEY:     ${{ secrets.GROQ_KEY }}
+          GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LOG_LEVEL:    "INFO"
+        run: timeout 240 python main.py --mode weekly_report || true
