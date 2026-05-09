@@ -1,14 +1,8 @@
-# .github/workflows/scalp.yml
-# ═══════════════════════════════════════════════════════════════
-# ⚡ SCALP — صياد الفرص السريعة
-# كل 5 دقائق: Quick Scalp (Fibonacci) + Classic Scalp (11 خبير)
-# ═══════════════════════════════════════════════════════════════
-
 name: "⚡ Scalp — Fast Opportunity Hunter"
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # كل 5 دقائق
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -16,15 +10,32 @@ jobs:
     name: "⚡ Run Scalp Engine"
     runs-on: ubuntu-latest
     timeout-minutes: 9
-
     steps:
-      - name: ⬇️ Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: ⚙️ Setup Bot Environment
-        uses: ./.github/actions/setup-bot
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: ⚡ Run Scalp Engine
+      - run: python -m pip install --upgrade pip
+
+      - name: Install deps
+        run: |
+          grep -v -iE "^pandas" requirements.txt > /tmp/req.txt || true
+          pip install -r /tmp/req.txt
+          pip install "pandas==2.2.2" "pandas-ta-classic"
+
+      - name: Patch pandas_ta
+        run: |
+          python -c "
+          import site, pathlib
+          p = pathlib.Path(site.getsitepackages()[0]) / 'pandas_ta.py'
+          p.write_text('import pandas_ta_classic\nfrom pandas_ta_classic import *\n')
+          print('pandas_ta OK')
+          "
+
+      - name: ⚡ Run Scalp
         env:
           OKX_KEY:      ${{ secrets.OKX_KEY }}
           OKX_SECRET:   ${{ secrets.OKX_SECRET }}
@@ -35,5 +46,4 @@ jobs:
           GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          LOG_LEVEL:    "INFO"
         run: timeout 240 python main.py --mode scalp || true
