@@ -1,0 +1,40 @@
+# .github/workflows/super_swing.yml
+# ═══════════════════════════════════════════════════════════════
+# 🦅 SUPER SWING — القناص النادر
+# كل 4 ساعات: يشترط توافق Gann + Square of 9 + SMC معاً
+# أهداف تصل إلى 50%
+# ═══════════════════════════════════════════════════════════════
+
+name: "🦅 Super Swing — Sniper Entries"
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"   # كل 4 ساعات
+  workflow_dispatch:
+
+jobs:
+  super_swing:
+    name: "🦅 Run Super Swing Engine"
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Bot Environment
+        uses: ./.github/actions/setup-bot
+
+      - name: 🦅 Run Super Swing Engine
+        env:
+          OKX_KEY:      ${{ secrets.OKX_KEY }}
+          OKX_SECRET:   ${{ secrets.OKX_SECRET }}
+          OKX_PASS:     ${{ secrets.OKX_PASS }}
+          BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:      ${{ secrets.CHAT_ID }}
+          GROQ_KEY:     ${{ secrets.GROQ_KEY }}
+          GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LOG_LEVEL:    "INFO"
+        run: timeout 240 python main.py --mode super_swing || true
