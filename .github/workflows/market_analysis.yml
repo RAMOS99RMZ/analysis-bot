@@ -1,0 +1,41 @@
+# .github/workflows/market_analysis.yml
+# ═══════════════════════════════════════════════════════════════
+# 📊 MARKET ANALYSIS — محلل السوق (E10 & E11)
+# جدولان: كل 4 ساعات (تحليل Bias) + منتصف الليل (تقرير يومي)
+# يحفظ النتيجة في Supabase ليقرأها Scalp/Swing بدون إعادة تحليل
+# ═══════════════════════════════════════════════════════════════
+
+name: "📊 Market Analysis — E10 & E11"
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"   # كل 4 ساعات: تحديث Market Bias
+    - cron: "0 0 * * *"     # منتصف الليل: تقرير يومي كامل (E11)
+  workflow_dispatch:
+
+jobs:
+  market_analysis:
+    name: "📊 Run Market Analysis"
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Bot Environment
+        uses: ./.github/actions/setup-bot
+
+      - name: 📊 Run Market Analysis
+        env:
+          OKX_KEY:      ${{ secrets.OKX_KEY }}
+          OKX_SECRET:   ${{ secrets.OKX_SECRET }}
+          OKX_PASS:     ${{ secrets.OKX_PASS }}
+          BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:      ${{ secrets.CHAT_ID }}
+          GROQ_KEY:     ${{ secrets.GROQ_KEY }}
+          GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LOG_LEVEL:    "INFO"
+        run: timeout 240 python main.py --mode analysis || true
