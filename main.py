@@ -151,23 +151,22 @@ async def run_super_swing():
 async def run_analysis():
     """
     📊 محلل السوق العام (E10 + E11).
-    - يحلل BTC/ETH على 1d/4h/1h
-    - يحدد Market Bias (Bull/Bear/Neutral)
+    - يحلل BTC/ETH على 4h/1h
+    - يحدد Market Bias ويرسله على Telegram
     - يحفظ النتيجة في Supabase
-    - عند منتصف الليل: يرسل التقرير اليومي الكامل (E11)
+    - عند منتصف الليل: يرسل التقرير اليومي الكامل
     """
     db, notifier, fetcher = await _startup()
     logger.info("📊 [ANALYSIS] بدء تحليل السوق …")
     try:
-        from scheduler.jobs import job_daily_market, init
+        # تحليل Bias + Telegram (يعمل دائماً)
+        await _update_market_bias(db, notifier, fetcher)
+
+        # التقرير اليومي فقط عند منتصف الليل
         from utils.helpers import utc_hour
-        init(db, notifier, fetcher)
-
-        # تحليل Bias (يعمل دائماً)
-        await _update_market_bias(db, fetcher)
-
-        # التقرير اليومي الكامل فقط عند منتصف الليل (00:00 UTC)
         if utc_hour() == 0:
+            from scheduler.jobs import job_daily_market, init
+            init(db, notifier, fetcher)
             logger.info("📊 [ANALYSIS] منتصف الليل — إرسال التقرير اليومي …")
             await job_daily_market()
 
@@ -180,23 +179,92 @@ async def run_analysis():
         await notifier.close()
 
 
-async def _update_market_bias(db: SupabaseLogger, fetcher: DataFetcher):
-    """يحسب Market Bias ويحفظه في Supabase."""
+async def _update_market_bias(db, notifier, fetcher):
+    """يحسب Market Bias ويرسل نتيجة على Telegram."""
     from engine.indicator_engine import IndicatorEngine
+    from datetime import datetime, timezone
     IE = IndicatorEngine()
+    results = []
+
     for symbol in ["BTC/USDT:USDT", "ETH/USDT:USDT"]:
         try:
             c4h = await fetcher.get_candles(symbol, "4h", 200)
             c1h = await fetcher.get_candles(symbol, "1h", 100)
             if not c4h or not c1h:
+                results.append(f"⚠️ {symbol.replace('/USDT:USDT','')}: لا بيانات")
                 continue
+            regime   = IE.get_market_regime(c4h, c1h)
+            bias     = "BULL" if regime.get("bull_align") else \
+                       "BEAR" if regime.get("bear_align") else "NEUTRAL"
+            strength = regime.get("strength", 0)
+            emoji    = "📈" if bias == "BULL" else "📉" if bias == "BEAR" else "↔️"
+            sym      = symbol.replace("/USDT:USDT", "")
+            await db.log_regime(symbol, bias, strength)
+            results.append(f"{emoji} {sym}: <b>{bias}</b> ({regime.get('regime','?')})")
+            logger.info(f"[BIAS] {symbol}: {bias}")
+        except Exception as e:
+            logger.warning(f"[BIAS] {symbol}: {e}")
+            results.append(f"❌ {symbol.replace('/USDT:USDT','')}: خطأ")
+
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    msg = (
+        f"📊 <b>Market Bias Update</b> — {now}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(results) +
+        f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>🎖️ Ramos Ai 360 — E10+E11</i>"
+    )
+    await notifier.send(msg)
+    logger.info("[ANALYSIS] رسالة Telegram أُرسلت ✅")
+
+
+async def _update_market_bias(db, notifier, fetcher):
+    """يحسب Market Bias ويحفظه في Supabase ويرسل Telegram."""
+    from engine.indicator_engine import IndicatorEngine
+    IE = IndicatorEngine()
+
+    results = []
+
+    for symbol in ["BTC/USDT:USDT", "ETH/USDT:USDT"]:
+        try:
+            c4h = await fetcher.get_candles(symbol, "4h", 200)
+            c1h = await fetcher.get_candles(symbol, "1h", 100)
+            if not c4h or not c1h:
+                results.append(f"⚠️ {symbol.replace('/USDT:USDT','')}: لا بيانات")
+                continue
+
             regime = IE.get_market_regime(c4h, c1h)
             bias   = "BULL" if regime.get("bull_align") else \
                      "BEAR" if regime.get("bear_align") else "NEUTRAL"
-            await db.log_regime(symbol, bias, regime.get("strength", 0.5))
-            logger.info(f"📊 [BIAS] {symbol}: {bias} ({regime.get('regime')})")
+            strength = regime.get("strength", 0)
+            label    = regime.get("label", "")
+
+            # حفظ في Supabase
+            await db.log_regime(symbol, bias, strength)
+
+            # إيموجي للبايس
+            emoji = "📈" if bias == "BULL" else "📉" if bias == "BEAR" else "↔️"
+            sym_clean = symbol.replace("/USDT:USDT", "")
+            results.append(f"{emoji} {sym_clean}: <b>{bias}</b> {label}")
+            logger.info(f"[BIAS] {symbol}: {bias} ({regime.get('regime')})")
+
         except Exception as e:
-            logger.warning(f"📊 [BIAS] {symbol} خطأ: {e}")
+            logger.warning(f"[BIAS] {symbol} خطأ: {e}")
+            results.append(f"❌ {symbol.replace('/USDT:USDT','')}: خطأ")
+
+    # ── إرسال رسالة Telegram ────────────────────────────────────
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    msg = (
+        f"📊 <b>Market Bias Update</b> — {now}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(results) +
+        f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>🎖️ Ramos Ai 360 — E10+E11 Analysis</i>"
+    )
+    await notifier.send(msg)
+    logger.info("[ANALYSIS] ✅ رسالة Telegram أُرسلت بنجاح")
 
 
 # ══════════════════════════════════════════════════════════════════════
