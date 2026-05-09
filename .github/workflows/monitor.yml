@@ -1,32 +1,41 @@
-# .github/workflows/monitor.yml
-# ═══════════════════════════════════════════════════════════════
-# 🛡️ MONITOR — الحارس الشخصي للصفقات
-# كل دقيقة: يراقب الأسعار الحية ويغلق عند TP/SL فوراً
-# ═══════════════════════════════════════════════════════════════
-
 name: "🛡️ Monitor — Position Guardian"
 
 on:
   schedule:
-    - cron: "* * * * *"    # كل دقيقة
-  workflow_dispatch:         # تشغيل يدوي من GitHub UI
+    - cron: "* * * * *"
+  workflow_dispatch:
 
 jobs:
   monitor:
     name: "🔍 Monitor Positions"
     runs-on: ubuntu-latest
     timeout-minutes: 9
-
     steps:
-      - name: ⬇️ Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── استدعاء الـ Composite Action المشترك ──────────────────
-      - name: ⚙️ Setup Bot Environment
-        uses: ./.github/actions/setup-bot
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-      # ── تشغيل المهمة ──────────────────────────────────────────
-      - name: 🛡️ Run Position Monitor
+      - run: python -m pip install --upgrade pip
+
+      - name: Install deps
+        run: |
+          grep -v -iE "^pandas" requirements.txt > /tmp/req.txt || true
+          pip install -r /tmp/req.txt
+          pip install "pandas==2.2.2" "pandas-ta-classic"
+
+      - name: Patch pandas_ta
+        run: |
+          python -c "
+          import site, pathlib
+          p = pathlib.Path(site.getsitepackages()[0]) / 'pandas_ta.py'
+          p.write_text('import pandas_ta_classic\nfrom pandas_ta_classic import *\n')
+          print('pandas_ta OK')
+          "
+
+      - name: 🛡️ Run Monitor
         env:
           OKX_KEY:      ${{ secrets.OKX_KEY }}
           OKX_SECRET:   ${{ secrets.OKX_SECRET }}
@@ -37,5 +46,4 @@ jobs:
           GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          LOG_LEVEL:    "INFO"
         run: timeout 240 python main.py --mode monitor || true
