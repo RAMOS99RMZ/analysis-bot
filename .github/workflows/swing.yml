@@ -1,14 +1,8 @@
-# .github/workflows/swing.yml
-# ═══════════════════════════════════════════════════════════════
-# 🌊 SWING — صياد الاتجاهات المتوسطة
-# كل 2 ساعة: يقرأ 1H و 4H ويتجاهل الضجيج القصير
-# ═══════════════════════════════════════════════════════════════
-
 name: "🌊 Swing — Trend Hunter"
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # كل ساعتين
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 
 jobs:
@@ -16,15 +10,32 @@ jobs:
     name: "🌊 Run Swing Engine"
     runs-on: ubuntu-latest
     timeout-minutes: 9
-
     steps:
-      - name: ⬇️ Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: ⚙️ Setup Bot Environment
-        uses: ./.github/actions/setup-bot
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: 🌊 Run Swing Engine
+      - run: python -m pip install --upgrade pip
+
+      - name: Install deps
+        run: |
+          grep -v -iE "^pandas" requirements.txt > /tmp/req.txt || true
+          pip install -r /tmp/req.txt
+          pip install "pandas==2.2.2" "pandas-ta-classic"
+
+      - name: Patch pandas_ta
+        run: |
+          python -c "
+          import site, pathlib
+          p = pathlib.Path(site.getsitepackages()[0]) / 'pandas_ta.py'
+          p.write_text('import pandas_ta_classic\nfrom pandas_ta_classic import *\n')
+          print('pandas_ta OK')
+          "
+
+      - name: 🌊 Run Swing
         env:
           OKX_KEY:      ${{ secrets.OKX_KEY }}
           OKX_SECRET:   ${{ secrets.OKX_SECRET }}
@@ -35,5 +46,4 @@ jobs:
           GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          LOG_LEVEL:    "INFO"
         run: timeout 240 python main.py --mode swing || true
