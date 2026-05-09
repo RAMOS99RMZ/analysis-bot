@@ -1,84 +1,64 @@
 # engine/data_fetcher.py
-# ══════════════════════════════════════════════════════════════════
-# الإصلاح الجوهري: فصل Exchange عام (بيانات السوق) عن الخاص (الحساب)
-# البيانات العامة (شموع، أسعار) لا تحتاج API Key
-# البيانات الخاصة (رصيد، مراكز) تحتاج API Key حقيقي
-# ══════════════════════════════════════════════════════════════════
+# Mirrors: getAllData, getCandles, getLivePrice, getFundingRate, getOnChainData
+# Uses CCXT for exchange abstraction + async for performance
 
 from __future__ import annotations
 import asyncio, time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import ccxt.async_support as ccxt
 import httpx
 from loguru import logger
 from config import Secrets, CONFIG
 from utils.helpers import clear_api_fails, record_api_fail, is_circuit_open
 
-# ── Cache ─────────────────────────────────────────────────────────
+# ── Candle TTL cache (mirrors _CANDLES_CACHE in GAS) ─────────────────────────
 _CANDLES_CACHE: Dict[str, Dict] = {}
 _TTL = {"5m": 120, "15m": 90, "30m": 180, "1h": 300, "4h": 600, "1d": 900, "1w": 43200}
 _TICKERS_CACHE: Dict = {"data": None, "ts": 0}
 _FUNDING_CACHE: Dict = {}
-_SLOW_CACHE:    Dict = {}
+_SLOW_CACHE: Dict = {}
+
+# OKX CCXT timeframe map
+_TF_MAP = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1w"}
 
 
 class DataFetcher:
     """
-    OKX data fetcher مع فصل العام عن الخاص.
-
-    _public  → بدون مفاتيح → للشموع، الأسعار، الأوردر بوك
-    _private → بمفاتيح حقيقية → للرصيد، المراكز، الصفقات
+    Async CCXT-based data fetcher for OKX.
+    Replaces all UrlFetchApp calls in GAS with proper async HTTP.
     """
 
     def __init__(self) -> None:
-        # ── Exchange عام: بيانات السوق بدون مصادقة ──────────────
-        self._public = ccxt.okx({
+        self._exchange = ccxt.okx({
+            "apiKey":    Secrets.OKX_KEY,
+            "secret":    Secrets.OKX_SECRET,
+            "password":  Secrets.OKX_PASS,
             "enableRateLimit": True,
-            "options": {"defaultType": "swap"},
+            "options":   {"defaultType": "swap"},
         })
-
-        # ── Exchange خاص: عمليات الحساب بمفاتيح حقيقية ──────────
-        self._private = ccxt.okx({
-            "apiKey":          Secrets.OKX_KEY,
-            "secret":          Secrets.OKX_SECRET,
-            "password":        Secrets.OKX_PASS,
-            "enableRateLimit": True,
-            "options":         {"defaultType": "swap"},
-        })
-
-        # هل المفاتيح حقيقية؟
-        self._has_keys = all([
-            Secrets.OKX_KEY    and len(Secrets.OKX_KEY)    > 10,
-            Secrets.OKX_SECRET and len(Secrets.OKX_SECRET) > 10,
-            Secrets.OKX_PASS   and len(Secrets.OKX_PASS)   > 3,
-        ])
-        if not self._has_keys:
-            logger.warning(
-                "⚠️  [DataFetcher] مفاتيح OKX غير موجودة أو وهمية.\n"
-                "   ✅ البيانات العامة (شموع، أسعار) ستعمل بشكل طبيعي.\n"
-                "   ❌ الرصيد والمراكز لن تعمل حتى تضيف مفاتيح حقيقية."
-            )
 
     async def close(self) -> None:
-        await self._public.close()
-        if self._has_keys:
-            await self._private.close()
+        await self._exchange.close()
 
-    # ══════════════════════════════════════════════════════════════
-    # البيانات العامة — تعمل حتى بدون مفاتيح OKX
-    # ══════════════════════════════════════════════════════════════
+    # ── Candles ───────────────────────────────────────────────────────────────
 
     async def get_candles(self, symbol: str, timeframe: str = "5m",
                           limit: int = 100) -> Optional[List]:
-        """جلب الشموع — لا يحتاج API Key."""
+        """
+        Fetch OHLCV candles. Returns list[list] in OKX format:
+        [timestamp_ms, open, high, low, close, volume]
+        Newest candle is index 0 (OKX convention, matches GAS).
+        """
         key = f"{symbol}|{timeframe}|{limit}"
         ttl = _TTL.get(timeframe, 60)
         hit = _CANDLES_CACHE.get(key)
         if hit and (time.time() - hit["ts"]) < ttl:
             return hit["data"]
         try:
-            ohlcv = await self._public.fetch_ohlcv(symbol, timeframe, limit=limit)
-            ohlcv.reverse()   # OKX: أحدث أولاً
+            ohlcv = await self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            # CCXT returns oldest-first → reverse to newest-first (OKX/GAS convention)
+            ohlcv.reverse()
+            # Convert to list[list] matching OKX API format
             data = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in ohlcv]
             _CANDLES_CACHE[key] = {"data": data, "ts": time.time()}
             clear_api_fails()
@@ -89,7 +69,10 @@ class DataFetcher:
             return None
 
     async def get_all_data(self, symbol: str) -> Optional[Dict]:
-        """جلب كل الإطارات الزمنية — لا يحتاج API Key."""
+        """
+        Fetch 5m/15m/30m/1h/4h candles + orderbook in parallel.
+        Mirrors getAllData() in GAS (uses fetchAll equivalent).
+        """
         if is_circuit_open():
             logger.warning(f"[DataFetcher] Circuit breaker OPEN — skipping {symbol}")
             return None
@@ -106,7 +89,7 @@ class DataFetcher:
             r if not isinstance(r, Exception) else None for r in results
         ]
         if not c5m or len(c5m) < 20:
-            logger.warning(f"[DataFetcher] بيانات غير كافية لـ {symbol}")
+            logger.warning(f"[DataFetcher] Insufficient 5m data for {symbol}")
             return None
 
         book_imbalance = None
@@ -125,18 +108,21 @@ class DataFetcher:
         }
 
     async def fetch_all_assets(self) -> Dict[str, Optional[Dict]]:
-        """جلب بيانات كل العملات بالتوازي."""
+        """
+        Parallel fetch for all configured assets.
+        Mirrors fetchAllAssetsData() in GAS (with batching).
+        """
         tasks = {s: self.get_all_data(s) for s in CONFIG.ASSETS}
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
         out = {}
         for symbol, result in zip(tasks.keys(), results):
             out[symbol] = result if not isinstance(result, Exception) else None
         good = sum(1 for v in out.values() if v)
-        logger.info(f"[DataFetcher] تم جلب {good}/{len(CONFIG.ASSETS)} عملة بنجاح ✅")
+        logger.info(f"[DataFetcher] Fetched {good}/{len(CONFIG.ASSETS)} assets")
         return out
 
     async def get_slow_data(self, symbol: str) -> Dict:
-        """شموع 1D/1W — لا تحتاج API Key."""
+        """1D/1W candles cached 12 hours. Mirrors getSlowData()."""
         hit = _SLOW_CACHE.get(symbol)
         if hit and (time.time() - hit["ts"]) < 43200:
             return hit["data"]
@@ -152,8 +138,10 @@ class DataFetcher:
         _SLOW_CACHE[symbol] = {"data": data, "ts": time.time()}
         return data
 
+    # ── Price ─────────────────────────────────────────────────────────────────
+
     async def get_live_price(self, symbol: str) -> float:
-        """السعر الحي — لا يحتاج API Key."""
+        """Live price with batch cache. Mirrors getLivePrice()."""
         if _TICKERS_CACHE["data"] and (time.time() - _TICKERS_CACHE["ts"]) < 90:
             p = _TICKERS_CACHE["data"].get(symbol, 0)
             if p: return p
@@ -162,105 +150,104 @@ class DataFetcher:
 
     async def _refresh_tickers(self) -> None:
         try:
-            tickers = await self._public.fetch_tickers()
+            tickers = await self._exchange.fetch_tickers()
             _TICKERS_CACHE["data"] = {k: float(v.get("last", 0)) for k, v in tickers.items()}
-            _TICKERS_CACHE["ts"]   = time.time()
+            _TICKERS_CACHE["ts"] = time.time()
         except Exception as e:
             logger.warning(f"[DataFetcher] refresh_tickers: {e}")
 
+    # ── Order Book ────────────────────────────────────────────────────────────
+
     async def _get_order_book(self, symbol: str, depth: int = 20) -> Optional[Dict]:
-        """أوردر بوك — لا يحتاج API Key."""
         try:
-            return await self._public.fetch_order_book(symbol, depth)
+            ob = await self._exchange.fetch_order_book(symbol, depth)
+            return ob
         except Exception as e:
             logger.warning(f"[DataFetcher] order_book {symbol}: {e}")
             return None
 
-    async def get_fear_greed(self) -> Dict:
-        """Fear & Greed من alternative.me — لا يحتاج أي مفاتيح."""
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get("https://api.alternative.me/fng/?limit=1")
-                d = r.json()
-                val   = int(d["data"][0]["value"])
-                label = d["data"][0]["value_classification"]
-                return {
-                    "value": val, "label": label,
-                    "extreme_fear":  val < 25,
-                    "fear":          val < 45,
-                    "greed":         val > 55,
-                    "extreme_greed": val > 75,
-                }
-        except Exception as e:
-            logger.warning(f"[DataFetcher] fear_greed: {e}")
-            return {"value": 50, "label": "Neutral",
-                    "extreme_fear": False, "fear": False,
-                    "greed": False, "extreme_greed": False}
-
-    # ══════════════════════════════════════════════════════════════
-    # البيانات الخاصة — تحتاج مفاتيح OKX حقيقية
-    # ══════════════════════════════════════════════════════════════
-
-    async def get_balance(self) -> float:
-        """الرصيد الحي — يحتاج مفاتيح حقيقية."""
-        if not self._has_keys:
-            logger.warning("[DataFetcher] get_balance: لا توجد مفاتيح OKX حقيقية → رصيد وهمي 1000$")
-            return 1000.0   # رصيد افتراضي للاختبار
-        try:
-            bal = await self._private.fetch_balance()
-            return float(bal.get("USDT", {}).get("total", 0) or 0)
-        except Exception as e:
-            logger.warning(f"[DataFetcher] get_balance: {e}")
-            return 0.0
-
-    async def get_open_positions(self) -> List[Dict]:
-        """المراكز المفتوحة — يحتاج مفاتيح حقيقية."""
-        if not self._has_keys:
-            return []
-        try:
-            positions = await self._private.fetch_positions()
-            return [p for p in positions if float(p.get("contracts", 0)) != 0]
-        except Exception as e:
-            logger.warning(f"[DataFetcher] get_open_positions: {e}")
-            return []
+    # ── Funding Rate ──────────────────────────────────────────────────────────
 
     async def get_funding_rate(self, symbol: str) -> Dict:
-        """Funding Rate — لا يحتاج API Key (بيانات عامة)."""
+        """Mirrors getFundingRate() + getFundingHistory() in GAS."""
         hit = _FUNDING_CACHE.get(symbol)
         if hit and (time.time() - hit["ts"]) < 600:
             return hit["data"]
         try:
-            info = await self._public.fetch_funding_rate(symbol)
-            fr   = float(info.get("fundingRate", 0) or 0)
+            info = await self._exchange.fetch_funding_rate(symbol)
+            fr = float(info.get("fundingRate", 0) or 0)
             data = {
                 "funding_rate": fr,
-                "bullish":      fr < -0.0001,
-                "bearish":      fr > 0.0005,
-                "strong_bull":  fr < -0.0003,
-                "strong_bear":  fr > 0.0010,
+                "bullish": fr < -0.0001,
+                "bearish": fr > 0.0005,
+                "strong_bull": fr < -0.0003,
+                "strong_bear": fr > 0.0010,
             }
             _FUNDING_CACHE[symbol] = {"data": data, "ts": time.time()}
             return data
         except Exception as e:
             logger.warning(f"[DataFetcher] funding_rate {symbol}: {e}")
-            return {"funding_rate": 0, "bullish": False, "bearish": False,
-                    "strong_bull": False, "strong_bear": False}
+            return {"funding_rate": 0, "bullish": False, "bearish": False}
+
+    # ── Account Balance ───────────────────────────────────────────────────────
+
+    async def get_balance(self) -> float:
+        """Live USDT balance. Mirrors getRealBalance()."""
+        try:
+            bal = await self._exchange.fetch_balance()
+            total = bal.get("USDT", {}).get("total", 0) or 0
+            return float(total)
+        except Exception as e:
+            logger.warning(f"[DataFetcher] get_balance: {e}")
+            return 0.0
+
+    # ── Open Positions ────────────────────────────────────────────────────────
+
+    async def get_open_positions(self) -> List[Dict]:
+        """Fetch all currently open perpetual positions."""
+        try:
+            positions = await self._exchange.fetch_positions()
+            return [p for p in positions if float(p.get("contracts", 0)) != 0]
+        except Exception as e:
+            logger.warning(f"[DataFetcher] get_open_positions: {e}")
+            return []
+
+    # ── Fear & Greed Index (external API) ─────────────────────────────────────
+
+    async def get_fear_greed(self) -> Dict:
+        """Fetch BTC Fear & Greed from alternative.me."""
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get("https://api.alternative.me/fng/?limit=1")
+                d = r.json()
+                val = int(d["data"][0]["value"])
+                label = d["data"][0]["value_classification"]
+                return {
+                    "value": val, "label": label,
+                    "extreme_fear": val < 25, "fear": val < 45,
+                    "greed": val > 55, "extreme_greed": val > 75,
+                }
+        except Exception as e:
+            logger.warning(f"[DataFetcher] fear_greed: {e}")
+            return {"value": 50, "label": "Neutral", "extreme_fear": False,
+                    "fear": False, "greed": False, "extreme_greed": False}
+
+    # ── BTC Global Bias ───────────────────────────────────────────────────────
 
     async def get_btc_global_bias(self) -> Dict:
-        """BTC Global Bias — لا يحتاج API Key."""
+        """Get BTC 4H + 1H trend alignment. Mirrors getBTCGlobalBias()."""
         from engine.indicator_engine import IndicatorEngine
         btc = "BTC/USDT:USDT"
-        c4h, c1h = await asyncio.gather(
-            self.get_candles(btc, "4h", 50),
-            self.get_candles(btc, "1h", 30),
-        )
+        tasks = [self.get_candles(btc, "4h", 50), self.get_candles(btc, "1h", 30)]
+        results = await asyncio.gather(*tasks)
+        c4h, c1h = results
         if not c4h or not c1h:
-            return {"bias": "NEUTRAL", "reason": "No data"}
+            return {"bias": "NEUTRAL", "reason": ""}
         ie = IndicatorEngine()
         t4 = ie.get_trend(c4h)
         t1 = ie.get_trend_1h(c1h)
-        if t4 == "BULL" and t1 == "BULL":
-            return {"bias": "BULL_STRONG", "reason": "BTC 4H+1H صاعد"}
         if t4 == "BEAR" and t1 == "BEAR":
-            return {"bias": "BEAR_STRONG", "reason": "BTC 4H+1H هابط"}
-        return {"bias": "NEUTRAL", "reason": "مختلط"}
+            return {"bias": "BEAR_STRONG", "reason": "BTC 4H+1H bearish"}
+        if t4 == "BULL" and t1 == "BULL":
+            return {"bias": "BULL_STRONG", "reason": "BTC 4H+1H bullish"}
+        return {"bias": "NEUTRAL", "reason": ""}
