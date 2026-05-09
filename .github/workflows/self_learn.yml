@@ -1,0 +1,41 @@
+# .github/workflows/self_learn.yml
+# ═══════════════════════════════════════════════════════════════
+# 🧠 SELF LEARN — دماغ البوت
+# كل أحد 10:00 صباحاً UTC:
+# يراجع الصفقات المغلقة، يقيّم الخبراء، يعدّل أوزانهم
+# خبير خسّر → وزن أقل | خبير ربح → وزن أكثر
+# ═══════════════════════════════════════════════════════════════
+
+name: "🧠 Self Learn — Expert Weight Optimizer"
+
+on:
+  schedule:
+    - cron: "0 10 * * 0"    # كل أحد الساعة 10:00 UTC
+  workflow_dispatch:
+
+jobs:
+  self_learn:
+    name: "🧠 Run Self Learn Engine"
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Bot Environment
+        uses: ./.github/actions/setup-bot
+
+      - name: 🧠 Run Self Learn Engine
+        env:
+          OKX_KEY:      ${{ secrets.OKX_KEY }}
+          OKX_SECRET:   ${{ secrets.OKX_SECRET }}
+          OKX_PASS:     ${{ secrets.OKX_PASS }}
+          BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:      ${{ secrets.CHAT_ID }}
+          GROQ_KEY:     ${{ secrets.GROQ_KEY }}
+          GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LOG_LEVEL:    "INFO"
+        run: timeout 240 python main.py --mode self_learn || true
