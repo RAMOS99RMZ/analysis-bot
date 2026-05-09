@@ -1,0 +1,41 @@
+# .github/workflows/monitor.yml
+# ═══════════════════════════════════════════════════════════════
+# 🛡️ MONITOR — الحارس الشخصي للصفقات
+# كل دقيقة: يراقب الأسعار الحية ويغلق عند TP/SL فوراً
+# ═══════════════════════════════════════════════════════════════
+
+name: "🛡️ Monitor — Position Guardian"
+
+on:
+  schedule:
+    - cron: "* * * * *"    # كل دقيقة
+  workflow_dispatch:         # تشغيل يدوي من GitHub UI
+
+jobs:
+  monitor:
+    name: "🔍 Monitor Positions"
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      # ── استدعاء الـ Composite Action المشترك ──────────────────
+      - name: ⚙️ Setup Bot Environment
+        uses: ./.github/actions/setup-bot
+
+      # ── تشغيل المهمة ──────────────────────────────────────────
+      - name: 🛡️ Run Position Monitor
+        env:
+          OKX_KEY:      ${{ secrets.OKX_KEY }}
+          OKX_SECRET:   ${{ secrets.OKX_SECRET }}
+          OKX_PASS:     ${{ secrets.OKX_PASS }}
+          BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:      ${{ secrets.CHAT_ID }}
+          GROQ_KEY:     ${{ secrets.GROQ_KEY }}
+          GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LOG_LEVEL:    "INFO"
+        run: timeout 240 python main.py --mode monitor || true
