@@ -142,27 +142,27 @@ class BotConfig:
     ATR_PERIOD:      int   = 14
     PRICE_DRIFT_MAX: float = 0.015
     MAX_ATR_PCT:     float = 0.12
-    MIN_RR:          float = 0.8
+    MIN_RR:          float = 0.6
     MAX_SIZE_PCT:    float = 0.05
     MAX_SIGNALS_PER_RUN: int = 15
 
     # ── Signal Quality Thresholds ─────────────────────────────────────────────
     # Swing
-    MIN_SCORE_10:     float = 2.5
-    MIN_EXPERT_VOTES: int   = 3
-    MIN_MTF:          float = 0.03
+    MIN_SCORE_10:     float = 0.45
+    MIN_EXPERT_VOTES: int   = 2
+    MIN_MTF:          float = 0.02
     # Mixed
-    MIXED_MIN_SCORE:  float = 2.5
+    MIXED_MIN_SCORE:  float = 0.40
     MIXED_MIN_VOTES:  int   = 2
-    MIXED_MIN_MTF:    float = 0.05
+    MIXED_MIN_MTF:    float = 0.02
     # Scalp
-    SCALP_MIN_SCORE:  float = 2.0
+    SCALP_MIN_SCORE:  float = 0.32
     SCALP_MIN_VOTES:  int   = 2
-    SCALP_MIN_MTF:    float = 0.02
+    SCALP_MIN_MTF:    float = 0.01
     # NY Open Opportunity Window
-    OPP_WINDOW_SCORE: float = 1.0
+    OPP_WINDOW_SCORE: float = 0.20
     OPP_WINDOW_VOTES: int   = 1
-    OPP_WINDOW_MTF:   float = 0.02
+    OPP_WINDOW_MTF:   float = 0.01
 
     # ── Multi-Timeframe Weights ───────────────────────────────────────────────
     MTF_W_5M:  float = 0.10
@@ -235,10 +235,10 @@ ASSET_VOLATILITY: Dict[str, VolProfile] = {
 }
 
 VOL_THRESHOLDS: Dict[VolProfile, VolThreshold] = {
-    "LOW":       VolThreshold(min_score=1.0, min_votes=1, min_mtf=0.02, min_rr=0.8, max_atr=0.12),
-    "MEDIUM":    VolThreshold(min_score=1.5, min_votes=1, min_mtf=0.03, min_rr=0.8, max_atr=0.12),
-    "HIGH":      VolThreshold(min_score=2.0, min_votes=1, min_mtf=0.04, min_rr=0.9, max_atr=0.12),
-    "VERY_HIGH": VolThreshold(min_score=2.5, min_votes=2, min_mtf=0.05, min_rr=1.0, max_atr=0.12),
+    "LOW":       VolThreshold(min_score=0.30, min_votes=1, min_mtf=0.02, min_rr=0.8, max_atr=0.12),
+    "MEDIUM":    VolThreshold(min_score=0.30, min_votes=1, min_mtf=0.03, min_rr=0.8, max_atr=0.12),
+    "HIGH":      VolThreshold(min_score=0.40, min_votes=1, min_mtf=0.04, min_rr=0.9, max_atr=0.12),
+    "VERY_HIGH": VolThreshold(min_score=0.50, min_votes=2, min_mtf=0.05, min_rr=1.0, max_atr=0.12),
 }
 
 # ── Portfolio Limits ──────────────────────────────────────────────────────────
