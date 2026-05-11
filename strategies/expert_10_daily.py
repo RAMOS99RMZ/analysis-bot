@@ -1,281 +1,164 @@
-
-# strategies/expert_10_daily.py — E10: Daily Director
+# strategies/expert_11_usdt.py — E11: USDT Dominance Analyst
 # ═══════════════════════════════════════════════════════════════════
-# وظيفة E10: تحليل شارت BTC/ETH على 1D/4H/1H
-#   → تحديد اتجاه السوق (LONG/SHORT)
-#   → تحديد نوع التداول (Scalp / Swing / كلاهما)
-#   → تخزين النتيجة لباقي الخبراء
+# وظيفة E11: تحليل شارت USDT.D فقط
+#   → USDT.D صاعد = أموال تهرب من كريبتو → SHORT
+#   → USDT.D هابط = أموال تدخل كريبتو   → LONG
 #
-# الإصلاحات المطبّقة:
-#   1. CME Gap — weekday() حقيقي بدل فهرس الشمعة
-#   2. ATR Filter — مضاعف الثقة حسب بيئة التذبذب
-#   3. Level Proximity — تعزيز النقاط عند قرب السعر من S/R
+# يتتبع تاريخ USDT.D في الذاكرة لحساب الاتجاه الحقيقي
 # ═══════════════════════════════════════════════════════════════════
 from __future__ import annotations
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 from engine.indicator_engine import IndicatorEngine
-from utils.helpers import calc_volume_profile, utc_weekday
 
 IE = IndicatorEngine()
 
+# ── ذاكرة تاريخية لـ USDT.D (تُملأ مع كل استدعاء) ──────────────────
+_USDT_D_HISTORY: Deque[float] = deque(maxlen=12)  # آخر 12 قراءة
+
 
 # ─────────────────────────────────────────────────────────────────
-# 1. CME Gap — يبحث عن الجمعة الحقيقية والاثنين الحقيقي
+# تحليل اتجاه USDT.D من السجل التاريخي
 # ─────────────────────────────────────────────────────────────────
-def _detect_cme_gap(c1d: List) -> Dict:
+def _analyze_usdt_trend(history: Deque[float]) -> Tuple[str, float, str]:
     """
-    يكتشف CME Gap بين إغلاق الجمعة وفتح الاثنين.
-    يستخدم timestamp الحقيقي لكل شمعة لتحديد اليوم.
-    c1d[i] = [timestamp_ms, open, high, low, close, volume]
+    يحلل السجل التاريخي لـ USDT.D ويُرجع:
+    (trend: RISING/FALLING/FLAT, slope: معدل التغيير, label: نص)
     """
-    try:
-        if not c1d or len(c1d) < 5:
-            return {"has_gap": False}
+    if len(history) < 3:
+        return "UNKNOWN", 0.0, "بيانات غير كافية"
 
-        friday_close: Optional[float] = None
-        monday_open:  Optional[float] = None
+    vals = list(history)   # الأحدث في النهاية (deque order)
 
-        for candle in c1d[:14]:                    # آخر 14 يوم
-            ts = int(candle[0]) / 1000             # ms → seconds
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            wd = dt.weekday()                      # 0=Mon, 4=Fri
+    # حساب الانحدار الخطي البسيط (slope)
+    n    = len(vals)
+    xs   = list(range(n))
+    xm   = sum(xs) / n
+    ym   = sum(vals) / n
+    num  = sum((xs[i] - xm) * (vals[i] - ym) for i in range(n))
+    den  = sum((xs[i] - xm) ** 2 for i in range(n))
+    slope = num / den if den != 0 else 0.0
 
-            if wd == 4 and friday_close is None:   # جمعة
-                friday_close = float(candle[4])
-            elif wd == 0 and monday_open is None:  # اثنين
-                monday_open  = float(candle[1])
+    # مقارنة آخر 3 قراءات مع أول 3 قراءات
+    recent_avg = sum(vals[-3:]) / 3
+    old_avg    = sum(vals[:3])  / 3
+    change_pct = ((recent_avg - old_avg) / old_avg * 100) if old_avg > 0 else 0.0
 
-            if friday_close is not None and monday_open is not None:
-                break
+    if slope > 0.02 or change_pct > 0.3:
+        trend = "RISING"
+        label = f"USDT.D في صعود ↑ (slope={slope:.3f})"
+    elif slope < -0.02 or change_pct < -0.3:
+        trend = "FALLING"
+        label = f"USDT.D في هبوط ↓ (slope={slope:.3f})"
+    else:
+        trend = "FLAT"
+        label = f"USDT.D مستقر ↔ (slope={slope:.3f})"
 
-        if friday_close is None or monday_open is None:
-            return {"has_gap": False}
-
-        gap_pct = (monday_open - friday_close) / friday_close
-
-        if abs(gap_pct) > 0.005:                   # فجوة > 0.5%
-            return {
-                "has_gap":  True,
-                "gap_pct":  round(gap_pct, 4),
-                "gap_fill": friday_close,
-                "bullish":  gap_pct < 0,           # فجوة أسفل = ستُملأ صعوداً
-            }
-        return {"has_gap": False}
-
-    except Exception:
-        return {"has_gap": False}
+    return trend, round(slope, 4), label
 
 
 # ─────────────────────────────────────────────────────────────────
-# 2. ATR Filter — تصنيف بيئة التذبذب وتعديل المضاعف
-# ─────────────────────────────────────────────────────────────────
-def _atr_filter(c4h: List, price: float) -> Tuple[float, str]:
-    """
-    يحسب ATR% ويُرجع (مضاعف النقاط, نص الحالة).
-    DEAD    < 0.5%  → 0.0  (لا تداول)
-    LOW     < 1.0%  → 0.6
-    NORMAL  1-4%    → 1.0  (مثالي)
-    HIGH    4-7%    → 0.7
-    EXTREME > 7%    → 0.0  (لا تداول)
-    """
-    try:
-        atr_val = IE.atr(c4h, 14)
-        atr_pct = (atr_val / price) * 100 if price > 0 else 2.0
-
-        if atr_pct < 0.5:   return 0.0, f"راكد جداً 💤 ({atr_pct:.2f}%)"
-        elif atr_pct < 1.0: return 0.6, f"تذبذب منخفض ⚠️ ({atr_pct:.2f}%)"
-        elif atr_pct <= 4.0:return 1.0, f"بيئة مثالية ✅ ({atr_pct:.2f}%)"
-        elif atr_pct <= 7.0:return 0.7, f"تذبذب مرتفع ⚠️ ({atr_pct:.2f}%)"
-        else:                return 0.0, f"خطر — تذبذب متطرف 🚨 ({atr_pct:.2f}%)"
-    except Exception:
-        return 1.0, "ATR غير محسوب"
-
-
-# ─────────────────────────────────────────────────────────────────
-# 3. Level Proximity — تعزيز النقاط عند قرب السعر من S/R
-# ─────────────────────────────────────────────────────────────────
-def _proximity_bonus(c4h: List, c1d: List, price: float) -> Tuple[float, str]:
-    """
-    يفحص هل السعر قريب من مستوى مهم (Pivot/Fib/EMA/POC).
-    القرب = ضمن 1.5% من المستوى.
-    يُرجع (نقطة إضافية 0→0.15, سبب).
-    """
-    try:
-        zone = price * 0.015   # 1.5% من السعر
-
-        levels: List[Tuple[str, float]] = []
-
-        # Pivot Points من الشمعة اليومية السابقة
-        if c1d and len(c1d) >= 2:
-            prev = c1d[1]
-            H = float(prev[2]); L = float(prev[3]); C = float(prev[4])
-            PP = (H + L + C) / 3
-            levels += [
-                ("PP",    PP),
-                ("R1",    2*PP - L),
-                ("S1",    2*PP - H),
-            ]
-
-        # EMA المهمة
-        ema20  = IE.ema(c4h, 20)  if c4h else None
-        ema50  = IE.ema(c4h, 50)  if c4h else None
-        ema200 = IE.ema(c4h, 200) if c4h and len(c4h) >= 200 else None
-        for name, val in [("EMA20", ema20), ("EMA50", ema50), ("EMA200", ema200)]:
-            if val:
-                levels.append((name, val))
-
-        # Fibonacci
-        lookback = (c4h or [])[:60]
-        if len(lookback) >= 20:
-            hi  = max(float(c[2]) for c in lookback)
-            lo  = min(float(c[3]) for c in lookback)
-            rng = hi - lo
-            for ratio, name in [(0.382,"F38"),(0.500,"F50"),(0.618,"F62")]:
-                levels.append((name, hi - rng * ratio))
-
-        # POC
-        vp  = calc_volume_profile(c4h[:40] if c4h else [], 10)
-        poc = vp.get("poc", 0)
-        if poc > 0:
-            levels.append(("POC", poc))
-
-        hits = [n for n, v in levels if v > 0 and abs(price - v) <= zone]
-
-        if len(hits) >= 3:
-            return 0.15, f"تقاطع قوي: {', '.join(hits[:3])}"
-        elif len(hits) == 2:
-            return 0.10, f"تقاطع: {', '.join(hits)}"
-        elif len(hits) == 1:
-            return 0.05, f"قرب من {hits[0]}"
-        else:
-            return 0.0, "بعيد عن المستويات الرئيسية"
-
-    except Exception:
-        return 0.0, "—"
-
-
-# ─────────────────────────────────────────────────────────────────
-# الدالة الرئيسية لـ E10
+# الدالة الرئيسية لـ E11
 # ─────────────────────────────────────────────────────────────────
 def analyze(data: Dict) -> Optional[Dict]:
     """
-    يحلل شارت BTC/ETH على 1D/4H/1H.
-    يُرجع: {name, long, short, why, trade_type, atr_label}
+    يحلل شارت USDT.D فقط ويُرجع اتجاه السوق.
+    يُرجع: {name, long, short, why, usdt_level, usdt_trend}
     """
+    global _USDT_D_HISTORY
+
     try:
-        c1d = data.get("c1d", [])
-        c1w = data.get("c1w", [])
-        c4h = data.get("c4h", [])
-        c1h = data.get("c1h", [])
-
-        if not c4h or len(c4h) < 20:
-            return None
-
-        price   = float(c4h[0][4])
+        usdt_d = data.get("usdt_dominance", {})
+        c4h    = data.get("c4h", [])   # فقط كـ fallback
         long_s  = 0.0
         short_s = 0.0
         why: Dict = {}
 
-        # ── ATR Filter (يُطبَّق في النهاية كمضاعف) ─────────────────
-        atr_mult, atr_label = _atr_filter(c4h, price)
-        why["atr"] = atr_label
+        # ── استخراج بيانات USDT.D ────────────────────────────────────
+        value   = float(usdt_d.get("usdt_d", usdt_d.get("value", 5.0)))
+        stables = float(usdt_d.get("stables", value))
+        btc_d   = float(usdt_d.get("btc_d",  50.0))
 
-        # إذا كانت البيئة غير قابلة للتداول — أرجع صفر مباشرة
-        if atr_mult == 0.0:
-            return {
-                "name": "Daily", "long": 0.0, "short": 0.0,
-                "why": why, "trade_type": "NONE", "atr_label": atr_label,
-            }
+        # ── تحديث السجل التاريخي ─────────────────────────────────────
+        if value > 0:
+            _USDT_D_HISTORY.append(value)
 
-        # ── 1. Weekly Trend ──────────────────────────────────────────
-        if c1w and len(c1w) >= 4:
-            wk_trend = IE.get_trend(c1w)
-            if wk_trend == "BULL":
-                long_s  += 0.30; why["weekly"] = "Weekly BULL ↑"
-            elif wk_trend == "BEAR":
-                short_s += 0.30; why["weekly"] = "Weekly BEAR ↓"
+        # ── تحليل الاتجاه من السجل ───────────────────────────────────
+        hist_trend, slope, hist_label = _analyze_usdt_trend(_USDT_D_HISTORY)
+        why["usdt_trend"] = hist_label
 
-        # ── 2. Daily Trend ───────────────────────────────────────────
-        if c1d and len(c1d) >= 20:
-            d_trend = IE.get_trend(c1d)
-            if d_trend == "BULL":
-                long_s  += 0.25; why["daily"] = "Daily BULL"
-            elif d_trend == "BEAR":
-                short_s += 0.25; why["daily"] = "Daily BEAR"
+        # ── 1. اتجاه USDT.D الحالي ───────────────────────────────────
+        # قراءة rising/falling من البيانات المُمرَّرة
+        passed_trend = usdt_d.get("trend", "NEUTRAL")
+        rising  = usdt_d.get("rising",  hist_trend == "RISING")
+        falling = usdt_d.get("falling", hist_trend == "FALLING")
 
-        # ── 3. Daily POC ─────────────────────────────────────────────
-        if c1d and len(c1d) >= 10:
-            vp  = calc_volume_profile(c1d, 30)
-            poc = vp.get("poc", 0)
-            if poc > 0:
-                if price > poc * 1.002:
-                    long_s  += 0.20; why["poc"] = f"فوق POC اليومي ${poc:,.0f}"
-                elif price < poc * 0.998:
-                    short_s += 0.20; why["poc"] = f"تحت POC اليومي ${poc:,.0f}"
+        if falling or hist_trend == "FALLING":
+            long_s  += 0.45
+            why["usdt_direction"] = f"USDT.D هابط ↓ {value:.3f}% — دخول كريبتو 🟢"
+        elif rising or hist_trend == "RISING":
+            short_s += 0.45
+            why["usdt_direction"] = f"USDT.D صاعد ↑ {value:.3f}% — خروج من كريبتو 🔴"
+        elif passed_trend in ("BEAR", "BEAR_WEAK"):
+            long_s  += 0.25
+            why["usdt_direction"] = f"USDT.D اتجاه هبوطي {value:.3f}%"
+        elif passed_trend in ("BULL", "BULL_WEAK"):
+            short_s += 0.25
+            why["usdt_direction"] = f"USDT.D اتجاه صعودي {value:.3f}%"
 
-        # ── 4. CME Gap (weekday حقيقي) ───────────────────────────────
-        gap = _detect_cme_gap(c1d)
-        if gap["has_gap"]:
-            gap_pct_str = f"{abs(gap['gap_pct']):.2%}"
-            if gap["bullish"]:
-                long_s  += 0.25
-                why["cme"] = f"CME Gap صاعد {gap_pct_str} — ستُملأ صعوداً"
-            else:
-                short_s += 0.25
-                why["cme"] = f"CME Gap هابط {gap_pct_str} — ستُملأ هبوطاً"
+        # ── 2. المستويات المتطرفة ─────────────────────────────────────
+        if value < 4.0:
+            long_s  += 0.20
+            why["usdt_extreme"] = f"USDT.D منخفض جداً {value:.3f}% — ذروة دخول كريبتو 🚀"
+        elif value > 9.0:
+            short_s += 0.20
+            why["usdt_extreme"] = f"USDT.D مرتفع جداً {value:.3f}% — ذروة خروف من كريبتو ⛔"
+        elif value > 8.0:
+            short_s += 0.15
+            why["usdt_extreme"] = f"USDT.D مرتفع {value:.3f}% — تحذير ⚠️"
+        elif value < 5.0:
+            long_s  += 0.10
+            why["usdt_extreme"] = f"USDT.D منخفض {value:.3f}% — إيجابي 🟢"
 
-        # ── 5. 4H Regime ─────────────────────────────────────────────
-        regime = IE.get_market_regime(c4h, c1h)
-        if regime.get("bull_align"):
-            long_s  += 0.20; why["regime"] = "4H EMA مصطفة صعوداً"
-        elif regime.get("bear_align"):
-            short_s += 0.20; why["regime"] = "4H EMA مصطفة هبوطاً"
+        # ── 3. مجموع Stablecoins (USDT + USDC) ───────────────────────
+        if stables > 15.0:
+            # سيولة ضخمة في stablecoins → قد تنتقل للكريبتو قريباً
+            long_s  += 0.10
+            why["stables"] = f"Stables {stables:.1f}% — سيولة ضخمة تنتظر 💰"
+        elif stables < 8.0:
+            # معظم الأموال في كريبتو → تشبع → تحذير انعكاس
+            short_s += 0.05
+            why["stables"] = f"Stables {stables:.1f}% — أموال مستثمرة بالكامل ⚠️"
 
-        # ── 6. Weekday Bonus (ثلاثاء/أربعاء/خميس أقوى إحصائياً) ─────
-        wd = utc_weekday()
-        if wd in (1, 2, 3):
-            long_s  += 0.05; why["weekday"] = "أيام قوة إحصائية (ث/ر/خ)"
+        # ── 4. BTC Dominance كمؤشر نوعية السوق ──────────────────────
+        if btc_d > 60:
+            # BTC يسيطر بقوة → altcoins ضعيفة → تحذير للـ alts
+            why["btc_dom"] = f"BTC.D مرتفع {btc_d:.1f}% — تجنب الـ Alts"
+        elif btc_d < 40:
+            # موسم altcoins
+            long_s  += 0.05
+            why["btc_dom"] = f"BTC.D منخفض {btc_d:.1f}% — موسم Alts 🌟"
 
-        # ── 7. Level Proximity Bonus ─────────────────────────────────
-        prox_bonus, prox_why = _proximity_bonus(c4h, c1d, price)
-        if prox_bonus > 0:
-            # نُضيف المكافأة للاتجاه الأقوى حالياً
-            if long_s >= short_s:
-                long_s  += prox_bonus
-            else:
-                short_s += prox_bonus
-            why["proximity"] = prox_why
-
-        # ── تطبيق ATR كمضاعف ─────────────────────────────────────────
-        long_s  = round(min(long_s  * atr_mult, 1.0), 4)
-        short_s = round(min(short_s * atr_mult, 1.0), 4)
-
-        # ── تحديد نوع التداول بناءً على ATR ─────────────────────────
-        try:
-            atr_val = IE.atr(c4h, 14)
-            atr_pct = (atr_val / price) * 100
-            if atr_pct < 1.5:
-                trade_type = "SCALP"           # تذبذب منخفض → scalp فقط
-            elif atr_pct > 4.0:
-                trade_type = "SWING"           # تذبذب مرتفع → swing فقط
-            else:
-                trade_type = "SCALP+SWING"     # بيئة مثالية → كلاهما
-        except Exception:
-            trade_type = "SCALP+SWING"
+        # ── 5. Fallback — اذا لم تتوفر بيانات USDT.D ─────────────────
+        if not usdt_d and c4h and len(c4h) >= 20:
+            trend4 = IE.get_trend(c4h)
+            if trend4 == "BULL":
+                long_s  += 0.20; why["proxy"] = "BTC 4H proxy BULL (لا بيانات USDT.D)"
+            elif trend4 == "BEAR":
+                short_s += 0.20; why["proxy"] = "BTC 4H proxy BEAR (لا بيانات USDT.D)"
 
         return {
-            "name":       "Daily",
-            "long":       long_s,
-            "short":      short_s,
-            "why":        why,
-            "trade_type": trade_type,
-            "atr_label":  atr_label,
+            "name":        "USDT",
+            "long":        round(min(long_s,  1.0), 4),
+            "short":       round(min(short_s, 1.0), 4),
+            "why":         why,
+            "usdt_level":  round(value, 3),
+            "usdt_trend":  hist_trend,
         }
 
     except Exception as e:
         return {
-            "name": "Daily", "long": 0.0, "short": 0.0,
-            "why": {"err": str(e)}, "trade_type": "UNKNOWN", "atr_label": "—",
+            "name": "USDT", "long": 0.0, "short": 0.0,
+            "why": {"err": str(e)}, "usdt_level": 0.0, "usdt_trend": "ERROR",
         }
