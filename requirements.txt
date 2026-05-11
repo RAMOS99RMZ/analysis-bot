@@ -1,49 +1,44 @@
 # ╔══════════════════════════════════════════════════════════════╗
-# ║        Ramos Ai 360 ♾️🎖️ — requirements.txt              ║
+# ║        Ramos Ai 360 ♾️🎖️ — requirements.txt  (v2)         ║
 # ║        Python >= 3.11 Required                              ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 # ── Exchange & Market Data ─────────────────────────────────────
-ccxt==4.3.93                  # OKX API connector (unified interface)
-websockets==12.0              # Live price streaming (WebSocket)
+ccxt==4.3.93
+websockets==12.0
 
 # ── Async Runtime ─────────────────────────────────────────────
-asyncio-throttle==1.0.2       # Rate limiting for async API calls
+asyncio-throttle==1.0.2
 
 # ── Technical Analysis ────────────────────────────────────────
-pandas==2.2.2                 # Core dataframe engine
-pandas-ta==0.3.14b0           # All TA indicators (RSI, MACD, EMA, ATR, etc.)
-numpy==1.26.4                 # Numerical operations
+pandas==2.2.2
+pandas-ta==0.3.14b0
+numpy==1.26.4
 
 # ── HMM Market Regime Detection ───────────────────────────────
-hmmlearn==0.3.2               # Hidden Markov Model (Expert: Regime)
-scikit-learn==1.5.0           # Dependency for hmmlearn + preprocessing
+hmmlearn==0.3.2
+scikit-learn==1.5.0
 
 # ── AI Integration ────────────────────────────────────────────
-anthropic==0.28.1             # Claude / Gemini fallback AI
-groq==0.9.0                   # Grok AI (xAI) — primary AI confirmation
-google-generativeai==0.7.2    # Gemini AI — secondary confirmation
+groq==0.9.0
+google-generativeai==0.7.2
 
 # ── Database (Supabase) ───────────────────────────────────────
-supabase==2.5.3               # Supabase Python client (signal + trade logs)
-postgrest==0.16.11            # PostgREST client (used internally by supabase)
+supabase==2.5.3
+postgrest==0.16.11
 
 # ── Telegram Notifications ────────────────────────────────────
-python-telegram-bot==21.3     # Async Telegram bot
+python-telegram-bot==21.3
 
-# ── Scheduling ────────────────────────────────────────────────
-APScheduler==3.10.4           # Cron-style scheduler (5m / 15m / 2h / 4h jobs)
-
-# ── Backtesting ───────────────────────────────────────────────
-vectorbt==0.26.2              # Vectorized backtesting engine
-plotly==5.22.0                # Backtest charts (used by vectorbt)
+# ── Scheduling (used only in --mode daemon) ───────────────────
+APScheduler==3.10.4
 
 # ── Environment & Config ──────────────────────────────────────
-python-dotenv==1.0.1          # Load .env secrets into os.environ
+python-dotenv==1.0.1
 
 # ── HTTP / Utilities ──────────────────────────────────────────
-httpx==0.27.0                 # Async HTTP client (Grok / Gemini calls)
-tenacity==8.3.0               # Retry logic with exponential backoff
-pytz==2024.1                  # Timezone handling (Silver Bullet sessions)
-python-dateutil==2.9.0        # Date parsing utilities
-loguru==0.7.2                 # Structured logging (replaces print/Logger.log)
+httpx==0.27.0
+tenacity==8.3.0
+pytz==2024.1
+python-dateutil==2.9.0
+loguru==0.7.2
