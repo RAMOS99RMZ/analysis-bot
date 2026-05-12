@@ -1,44 +1,42 @@
-# ╔══════════════════════════════════════════════════════════════╗
-# ║        Ramos Ai 360 ♾️🎖️ — requirements.txt  (v2)         ║
-# ║        Python >= 3.11 Required                              ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║   Ramos 360 Ai 🎖️ — requirements.txt                         ║
+# ║   Best-in-class Python libraries for quant trading             ║
+# ║   Python >= 3.11 required                                       ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
-# ── Exchange & Market Data ─────────────────────────────────────
+# ── Exchange (OKX public data — no keys needed for market data) ───
 ccxt==4.3.93
-websockets==12.0
 
-# ── Async Runtime ─────────────────────────────────────────────
-asyncio-throttle==1.0.2
-
-# ── Technical Analysis ────────────────────────────────────────
+# ── Technical Analysis (best available — no broken ta versions) ──
 pandas==2.2.2
-pandas-ta==0.3.14b0
+pandas-ta-classic==0.5.44          # compatible with pandas 2.x
 numpy==1.26.4
+scipy==1.13.1                      # statistical analysis (Hurst, entropy)
 
-# ── HMM Market Regime Detection ───────────────────────────────
-hmmlearn==0.3.2
+# ── Machine Learning / Regime Detection ───────────────────────────
 scikit-learn==1.5.0
 
-# ── AI Integration ────────────────────────────────────────────
-groq==0.9.0
-google-generativeai==0.7.2
+# ── AI APIs ───────────────────────────────────────────────────────
+groq==0.9.0                        # Grok xAI (primary — free tier)
+google-generativeai==0.7.2         # Gemini (secondary — free tier)
 
-# ── Database (Supabase) ───────────────────────────────────────
+# ── Database ──────────────────────────────────────────────────────
 supabase==2.5.3
-postgrest==0.16.11
 
-# ── Telegram Notifications ────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────
 python-telegram-bot==21.3
 
-# ── Scheduling (used only in --mode daemon) ───────────────────
-APScheduler==3.10.4
-
-# ── Environment & Config ──────────────────────────────────────
-python-dotenv==1.0.1
-
-# ── HTTP / Utilities ──────────────────────────────────────────
+# ── HTTP & Async ──────────────────────────────────────────────────
 httpx==0.27.0
 tenacity==8.3.0
+
+# ── Config & Logging ──────────────────────────────────────────────
+python-dotenv==1.0.1
+loguru==0.7.2
+
+# ── Scheduling ────────────────────────────────────────────────────
+APScheduler==3.10.4
+
+# ── Utilities ─────────────────────────────────────────────────────
 pytz==2024.1
 python-dateutil==2.9.0
-loguru==0.7.2
