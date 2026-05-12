@@ -1,163 +1,182 @@
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║   🎖️ Ramos Ai 360 ♾️🎖️ — main.py  (v2 — GitHub Actions Ready)         ║
-# ║   Two run modes:                                                            ║
-# ║     1) ONE-SHOT  : python main.py --mode {scalp|swing|super_swing|         ║
-# ║                                          monitor|daily|weekly|heartbeat|   ║
-# ║                                          backtest}                          ║
-# ║        → ينفّذ مهمة واحدة ثم ينتهي (مناسب لـ GitHub Actions cron).         ║
-# ║     2) DAEMON    : python main.py --mode daemon                            ║
-# ║        → يشغّل APScheduler ويبقى يعمل (مناسب للسيرفر الذاتي 24/7).        ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+main.py — Ramos 360 Ai 🎖️
+Central router. Each GitHub Actions workflow calls a specific --mode.
 
+Usage:
+  python main.py --mode monitor
+  python main.py --mode scalp
+  python main.py --mode swing
+  python main.py --mode super_swing
+  python main.py --mode analysis
+  python main.py --mode weekly_report
+  python main.py --mode self_learn
+  python main.py --mode backtest
+"""
 from __future__ import annotations
-import asyncio, sys, argparse
+import argparse, asyncio, sys, time
 from loguru import logger
-
-from config import CONFIG, Secrets, SCHEDULE, setup_logging
+from config import CONFIG, Secrets, setup_logging
 from database import SupabaseLogger
 from notifier import TelegramNotifier
 from engine.data_fetcher import DataFetcher
-import scheduler.jobs as jobs
 
 
-# ── Singletons (used by both daemon and one-shot modes) ────────────────────────
-async def _bootstrap() -> tuple:
+# ── Shared startup ─────────────────────────────────────────────────────────────
+
+async def _up() -> tuple[SupabaseLogger, TelegramNotifier, DataFetcher]:
     Secrets.validate()
-    db       = SupabaseLogger()
-    notifier = TelegramNotifier()
-    fetcher  = DataFetcher()
-    jobs.init(db, notifier, fetcher)
-    return db, notifier, fetcher
+    db  = SupabaseLogger()
+    tg  = TelegramNotifier()
+    fe  = DataFetcher()
+    return db, tg, fe
 
 
-async def _shutdown(notifier, fetcher):
-    try: await fetcher.close()
-    except Exception: pass
-    try: await notifier.close()
-    except Exception: pass
+# ══════════════════════════════════════════════════════════════════════
+# MODES
+# ══════════════════════════════════════════════════════════════════════
+
+async def _monitor():
+    db, tg, fe = await _up()
+    try:
+        from scheduler.jobs import job_monitor_positions, init
+        init(db, tg, fe); await job_monitor_positions()
+    except Exception as e:
+        logger.error(f"[MONITOR] {e}"); await tg.send_error("MONITOR", str(e))
+    finally:
+        await fe.close(); await tg.close()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ONE-SHOT MODE  (GitHub Actions friendly)
-# ══════════════════════════════════════════════════════════════════════════════
-JOB_MAP = {
-    "scalp":        jobs.job_run_scalp,
-    "swing":        jobs.job_run_swing,
-    "super_swing":  jobs.job_run_super_swing,
-    "monitor":      jobs.job_monitor_positions,
-    "daily":        jobs.job_daily_market,
-    "weekly":       jobs.job_weekly_report,
-    "heartbeat":    jobs.job_heartbeat,
+async def _scalp():
+    db, tg, fe = await _up()
+    try:
+        from scheduler.jobs import job_run_scalp, init
+        init(db, tg, fe); await job_run_scalp()
+    except Exception as e:
+        logger.error(f"[SCALP] {e}"); await tg.send_error("SCALP", str(e))
+    finally:
+        await fe.close(); await tg.close()
+
+
+async def _swing():
+    db, tg, fe = await _up()
+    try:
+        from scheduler.jobs import job_run_swing, init
+        init(db, tg, fe); await job_run_swing()
+    except Exception as e:
+        logger.error(f"[SWING] {e}"); await tg.send_error("SWING", str(e))
+    finally:
+        await fe.close(); await tg.close()
+
+
+async def _super_swing():
+    db, tg, fe = await _up()
+    try:
+        from scheduler.jobs import job_run_super_swing, init
+        init(db, tg, fe); await job_run_super_swing()
+    except Exception as e:
+        logger.error(f"[SUPER_SWING] {e}"); await tg.send_error("SUPER_SWING", str(e))
+    finally:
+        await fe.close(); await tg.close()
+
+
+async def _analysis():
+    db, tg, fe = await _up()
+    try:
+        from engine.analysis_engine import run_full_analysis
+        await run_full_analysis(db, tg, fe)
+    except Exception as e:
+        logger.error(f"[ANALYSIS] {e}"); await tg.send_error("ANALYSIS", str(e))
+    finally:
+        await fe.close(); await tg.close()
+
+
+async def _weekly():
+    db, tg, fe = await _up()
+    try:
+        from scheduler.jobs import job_weekly_report, init
+        init(db, tg, fe); await job_weekly_report()
+    except Exception as e:
+        logger.error(f"[WEEKLY] {e}"); await tg.send_error("WEEKLY", str(e))
+    finally:
+        await fe.close(); await tg.close()
+
+
+async def _self_learn():
+    db, tg, fe = await _up()
+    try:
+        from scheduler.jobs import job_self_learn, init
+        init(db, tg, fe); await job_self_learn()
+    except Exception as e:
+        logger.error(f"[SELF_LEARN] {e}"); await tg.send_error("SELF_LEARN", str(e))
+    finally:
+        await fe.close(); await tg.close()
+
+
+async def _backtest():
+    db, tg, fe = await _up()
+    try:
+        from backtesting.backtest_engine import BacktestEngine
+        engine  = BacktestEngine()
+        results = await engine.run()
+        report  = engine.format_report(results)
+        await tg.send(report)
+        logger.success("[BACKTEST] Done — report sent to Telegram")
+    except Exception as e:
+        logger.error(f"[BACKTEST] {e}"); await tg.send_error("BACKTEST", str(e))
+    finally:
+        await tg.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTER
+# ══════════════════════════════════════════════════════════════════════
+
+MODES = {
+    "monitor":       (_monitor,       "🛡️  every 1m  — monitor open positions"),
+    "scalp":         (_scalp,         "⚡  every 5m  — scalp engine (14 experts)"),
+    "swing":         (_swing,         "🌊  every 2h  — swing engine"),
+    "super_swing":   (_super_swing,   "🦅  every 4h  — super swing (Gann+Sq9)"),
+    "analysis":      (_analysis,      "📊  every 4h  — E10+E11 market bias"),
+    "weekly_report": (_weekly,        "📋  Mon 08:00 — weekly performance report"),
+    "self_learn":    (_self_learn,    "🧠  Sun 10:00 — expert weight optimizer"),
+    "backtest":      (_backtest,      "📈  manual    — pandas backtest 2026 BTC/ETH"),
 }
 
-async def run_once(mode: str):
-    db, notifier, fetcher = await _bootstrap()
-    try:
-        job = JOB_MAP.get(mode)
-        if not job:
-            logger.error(f"Unknown mode: {mode}")
-            return 2
-        logger.info(f"▶️  Running ONE-SHOT mode: {mode}")
-        await job()
-        logger.success(f"✅ Mode {mode} finished cleanly.")
-        return 0
-    finally:
-        await _shutdown(notifier, fetcher)
 
-
-async def run_backtest(args):
-    """Pure-pandas backtester for BTC & ETH on configurable date range."""
-    from backtesting.backtest_engine import BacktestEngine
-    db, notifier, fetcher = await _bootstrap()
-    try:
-        bt = BacktestEngine(fetcher)
-        symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-        report  = await bt.run(symbols=symbols,
-                               timeframe=args.timeframe,
-                               start_date=args.start,
-                               end_date=args.end)
-        # Pretty print + Telegram (best-effort)
-        print(BacktestEngine.format_report(report))
-        try:
-            await notifier.send("📊 <b>Backtest Report</b>\n<pre>"
-                                + BacktestEngine.format_report(report) + "</pre>")
-        except Exception as e:
-            logger.warning(f"Telegram send failed (non-fatal): {e}")
-        return 0
-    finally:
-        await _shutdown(notifier, fetcher)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DAEMON MODE  (full APScheduler — only for self-hosted 24/7)
-# ══════════════════════════════════════════════════════════════════════════════
-async def run_daemon():
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
-    db, notifier, fetcher = await _bootstrap()
-    await notifier.send_startup(CONFIG.ASSETS)
-    await db.heartbeat(CONFIG.VERSION, CONFIG.ASSETS)
-
-    sch = AsyncIOScheduler(timezone="UTC")
-    sch.add_job(jobs.job_monitor_positions, "interval",
-                minutes=SCHEDULE["monitor_positions_min"], id="monitor", max_instances=1)
-    sch.add_job(jobs.job_run_scalp, "interval",
-                minutes=SCHEDULE["run_scalp_min"], id="scalp", max_instances=1)
-    sch.add_job(jobs.job_run_swing, "interval",
-                hours=SCHEDULE["run_swing_hrs"], id="swing", max_instances=1)
-    sch.add_job(jobs.job_run_super_swing, "interval",
-                hours=SCHEDULE["run_super_swing_hrs"], id="super_swing", max_instances=1)
-    sch.add_job(jobs.job_daily_market, "cron", hour=0, minute=0, id="daily", max_instances=1)
-    sch.add_job(jobs.job_weekly_report, "cron",
-                day_of_week="mon", hour=8, minute=0, id="weekly", max_instances=1)
-    sch.add_job(jobs.job_heartbeat, "interval", hours=6, id="heartbeat", max_instances=1)
-    sch.start()
-    logger.info("⏱  APScheduler running — daemon mode")
-    try:
-        while True: await asyncio.sleep(60)
-    except (KeyboardInterrupt, SystemExit):
-        sch.shutdown()
-        await _shutdown(notifier, fetcher)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CLI ENTRY
-# ══════════════════════════════════════════════════════════════════════════════
-def parse_args():
-    p = argparse.ArgumentParser(prog="ramos_ai_360",
-        description="Ramos Ai 360 trading bot — one-shot or daemon")
-    p.add_argument("--mode", required=True,
-        choices=list(JOB_MAP.keys()) + ["daemon", "backtest"],
-        help="Job to run (one-shot) or 'daemon' for full scheduler.")
-    # Backtest args
-    p.add_argument("--symbols", default="BTC/USDT:USDT,ETH/USDT:USDT",
-        help="Comma-separated CCXT symbols for --mode backtest")
-    p.add_argument("--timeframe", default="1h",
-        help="Candle timeframe for backtest (1h, 4h, 1d)")
-    p.add_argument("--start", default="2026-01-01",
-        help="Backtest start date (YYYY-MM-DD)")
-    p.add_argument("--end",   default="2026-05-10",
-        help="Backtest end date (YYYY-MM-DD)")
-    return p.parse_args()
-
-
-async def _main():
+def main() -> None:
     setup_logging()
-    args = parse_args()
-    logger.info("=" * 60)
-    logger.info(f"  {CONFIG.NAME}  {CONFIG.VERSION}  —  mode={args.mode}")
-    logger.info("=" * 60)
-    if args.mode == "daemon":
-        await run_daemon();             return 0
-    if args.mode == "backtest":
-        return await run_backtest(args)
-    return await run_once(args.mode)
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description=f"🎖️ {CONFIG.NAME} {CONFIG.VERSION}",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    modes_help = "\n".join(f"  {k:<15} {v}" for k, (_, v) in MODES.items())
+    parser.add_argument(
+        "--mode", required=True, choices=list(MODES.keys()),
+        metavar="MODE",
+        help=f"Mode to run:\n{modes_help}",
+    )
+    args = parser.parse_args()
+    fn, desc = MODES[args.mode]
+
+    logger.info("=" * 55)
+    logger.info(f"  {CONFIG.NAME}  {CONFIG.VERSION}")
+    logger.info(f"  Mode: {args.mode.upper()}")
+    logger.info(f"  {desc}")
+    logger.info("=" * 55)
+
+    t0 = time.monotonic()
+    try:
+        asyncio.run(fn())
+    except KeyboardInterrupt:
+        logger.info("🛑 Stopped manually.")
+    except Exception as e:
+        logger.exception(f"💥 Fatal error in [{args.mode}]: {e}")
+        sys.exit(1)
+    finally:
+        elapsed = round(time.monotonic() - t0, 2)
+        logger.info(f"✅ [{args.mode}] finished in {elapsed}s")
 
 
 if __name__ == "__main__":
-    try:
-        rc = asyncio.run(_main())
-        sys.exit(rc or 0)
-    except RuntimeError as e:
-        logger.critical(f"💥 Startup failed: {e}"); sys.exit(1)
-    except Exception as e:
-        logger.exception(f"💥 Fatal error: {e}");   sys.exit(1)
+    main()
