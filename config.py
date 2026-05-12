@@ -1,230 +1,152 @@
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                                                                            ║
-# ║       🎖️ Ramos Ai 360 ♾️🎖️ — config.py                              ║
-# ║       Central Configuration & Environment Management                      ║
-# ║       Migrated from GAS CONFIG object (v101 GEMINI)                       ║
-# ║                                                                            ║
-# ║  SECURITY: ALL secrets come from environment variables (.env file).       ║
-# ║  NEVER hardcode any API key, token, or password in this file.             ║
-# ║                                                                            ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
+"""
+config.py — Ramos 360 Ai 🎖️
+Central configuration. ALL secrets from environment variables only.
+OKX keys are OPTIONAL — bot runs market analysis without them.
+"""
+from __future__ import annotations
 import os
-from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal
+from pathlib import Path
+from typing import Dict, List
 from dotenv import load_dotenv
 from loguru import logger
 
-# ── Load .env file (only in local development; GitHub Actions uses repo secrets)
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 ── SECRETS  (جميع المفاتيح السرية من البيئة)
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+# SECRETS — 100% from environment, zero hardcoding
+# ══════════════════════════════════════════════════════════════════════
 
 class Secrets:
-    """
-    Reads ALL sensitive credentials from environment variables.
-    Raises a clear error on startup if any required secret is missing.
-    """
+    # ── Telegram (mandatory) ────────────────────────────────────────
+    BOT_TOKEN:    str = os.getenv("BOT_TOKEN",    "")
+    CHAT_ID:      str = os.getenv("CHAT_ID",      "")
 
-    # ── OKX Exchange ──────────────────────────────────────────────────────────
-    OKX_KEY: str       = os.environ.get("OKX_KEY", "")
-    OKX_SECRET: str    = os.environ.get("OKX_SECRET", "")
-    OKX_PASS: str      = os.environ.get("OKX_PASS", "")
+    # ── Supabase (mandatory) ─────────────────────────────────────────
+    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+    SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
 
-    # ── Telegram ──────────────────────────────────────────────────────────────
-    BOT_TOKEN: str     = os.environ.get("BOT_TOKEN", "")
-    CHAT_ID: str       = os.environ.get("CHAT_ID", "")
+    # ── OKX (OPTIONAL — public market data works without keys) ───────
+    OKX_KEY:      str = os.getenv("OKX_KEY",      "")
+    OKX_SECRET:   str = os.getenv("OKX_SECRET",   "")
+    OKX_PASS:     str = os.getenv("OKX_PASS",     "")
 
-    # ── AI APIs ───────────────────────────────────────────────────────────────
-    GROQ_KEY: str      = os.environ.get("GROQ_KEY", "")
-    GEMINI_KEY: str    = os.environ.get("GEMINI_KEY", "")
-
-    # ── Supabase Database ─────────────────────────────────────────────────────
-    SUPABASE_URL: str  = os.environ.get("SUPABASE_URL", "")
-    SUPABASE_KEY: str  = os.environ.get("SUPABASE_KEY", "")
+    # ── AI APIs (optional, rate-limited on free tier) ─────────────────
+    GROQ_KEY:     str = os.getenv("GROQ_KEY",     "")
+    GEMINI_KEY:   str = os.getenv("GEMINI_KEY",   "")
 
     @classmethod
     def validate(cls) -> None:
-        """
-        Call this once at startup.  Logs warnings for missing optional keys
-        and raises RuntimeError for mandatory ones.
-        """
-        mandatory = {
-            "OKX_KEY":      cls.OKX_KEY,
-            "OKX_SECRET":   cls.OKX_SECRET,
-            "OKX_PASS":     cls.OKX_PASS,
-            "BOT_TOKEN":    cls.BOT_TOKEN,
-            "CHAT_ID":      cls.CHAT_ID,
-        }
-        optional = {
-            "GROQ_KEY":     cls.GROQ_KEY,
-            "GEMINI_KEY":   cls.GEMINI_KEY,
-            "SUPABASE_URL": cls.SUPABASE_URL,
-            "SUPABASE_KEY": cls.SUPABASE_KEY,
-        }
-        missing_mandatory = [k for k, v in mandatory.items() if not v]
-        missing_optional  = [k for k, v in optional.items()  if not v]
+        mandatory = {"BOT_TOKEN": cls.BOT_TOKEN, "CHAT_ID": cls.CHAT_ID,
+                     "SUPABASE_URL": cls.SUPABASE_URL, "SUPABASE_KEY": cls.SUPABASE_KEY}
+        missing = [k for k, v in mandatory.items() if not v]
+        if missing:
+            raise RuntimeError(f"❌ Missing secrets: {missing} — add to GitHub Secrets")
 
-        if missing_mandatory:
-            raise RuntimeError(
-                f"❌ MISSING MANDATORY SECRETS: {missing_mandatory}\n"
-                "Add them to your .env file or GitHub Actions secrets."
-            )
-        if missing_optional:
-            logger.warning(
-                f"⚠️  Optional secrets not set: {missing_optional}. "
-                "Some features (AI confirmation / Supabase logging) will be disabled."
-            )
-        logger.info("✅ All mandatory secrets loaded successfully.")
+        # OKX is optional
+        if not cls.OKX_KEY:
+            logger.warning("⚠️  OKX keys not set — using public data only (no live trading)")
+
+        # AI keys optional
+        missing_ai = [k for k, v in {"GROQ_KEY": cls.GROQ_KEY, "GEMINI_KEY": cls.GEMINI_KEY}.items() if not v]
+        if missing_ai:
+            logger.warning(f"⚠️  AI keys not set: {missing_ai} — AI confirmation disabled")
+
+        logger.info("✅ Secrets validated.")
+
+    @classmethod
+    def has_okx(cls) -> bool:
+        return bool(cls.OKX_KEY and cls.OKX_SECRET and cls.OKX_PASS)
+
+    @classmethod
+    def has_groq(cls) -> bool:
+        return bool(cls.GROQ_KEY)
+
+    @classmethod
+    def has_gemini(cls) -> bool:
+        return bool(cls.GEMINI_KEY)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 ── TRADING CONFIGURATION  (مُهاجَر من CONFIG في GAS)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── Volatility Profile Type ───────────────────────────────────────────────────
-VolProfile = Literal["LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
-
-
-@dataclass(frozen=True)
-class VolThreshold:
-    min_score: float
-    min_votes: int
-    min_mtf:   float
-    min_rr:    float
-    max_atr:   float
-
+# ══════════════════════════════════════════════════════════════════════
+# BOT CONFIG — migrated 1:1 from GAS CONFIG object
+# ══════════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class BotConfig:
-    # ── Identity ──────────────────────────────────────────────────────────────
-    NAME:    str = "Ramos Ai 360 ♾️🎖️"
-    VERSION: str = "v101 GEMINI → Python"
+    NAME:    str = "Ramos 360 Ai 🎖️"
+    VERSION: str = "v101 Python"
 
-    # ── Monitored Assets (OKX SWAP pairs) ────────────────────────────────────
     ASSETS: List[str] = field(default_factory=lambda: [
-        "BTC/USDT:USDT",   # OKX perpetual swap format in CCXT
-        "ETH/USDT:USDT",
-        "SOL/USDT:USDT",
-        "LINK/USDT:USDT",
-        "AVAX/USDT:USDT",
-        "DOGE/USDT:USDT",
-        "XRP/USDT:USDT",
+        "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+        "LINK/USDT:USDT", "AVAX/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT",
     ])
 
-    # ── Risk Management ───────────────────────────────────────────────────────
-    RISK_PERCENT:    float = 1.0         # % of balance risked per trade
-    SLIPPAGE_PCT:    float = 0.0005      # 0.05% estimated slippage
-    ATR_MULT_SL:     float = 1.5
-    ATR_MULT_TP1:    float = 1.0
-    ATR_MULT_TP2:    float = 2.0
-    ATR_MULT_TP3:    float = 3.0
+    # ── Risk ──────────────────────────────────────────────────────────
+    RISK_PERCENT:     float = 1.0
+    SLIPPAGE_PCT:     float = 0.0005
+    ATR_PERIOD:       int   = 14
+    MAX_ATR_PCT:      float = 0.12
+    MIN_RR:           float = 0.8
+    MAX_SIZE_PCT:     float = 0.05
+    PRICE_DRIFT_MAX:  float = 0.015
+    MAX_DAILY_LOSS:   float = 0.15
 
-    # ── Swing ATR Multipliers ─────────────────────────────────────────────────
-    SWING_ATR_MULT_SL:  float = 2.0
-    SWING_ATR_MULT_TP1: float = 2.5
-    SWING_ATR_MULT_TP2: float = 5.0
-    SWING_ATR_MULT_TP3: float = 8.0
-    SWING_ATR_MULT_TP4: float = 12.0
-    SWING_ATR_MULT_TP5: float = 16.0
-    SWING_ATR_MULT_TP6: float = 20.0
+    # ── Scalp ATR ─────────────────────────────────────────────────────
+    ATR_SL:  float = 1.5
+    ATR_TP1: float = 1.0
+    ATR_TP2: float = 2.0
+    ATR_TP3: float = 3.0
 
-    # ── Scalp / Swing TP Ranges ───────────────────────────────────────────────
-    SCALP_TP_MIN_PCT: float = 0.01       # 1%
-    SCALP_TP_MAX_PCT: float = 0.05       # 5%
-    SWING_TP_MIN:     float = 0.05       # 5%
-    SWING_TP_MAX:     float = 0.50       # 50%
+    # ── Swing ATR ─────────────────────────────────────────────────────
+    SWING_SL:  float = 2.0
+    SWING_TP1: float = 2.5
+    SWING_TP2: float = 5.0
+    SWING_TP3: float = 8.0
+    SWING_TP4: float = 12.0
+    SWING_TP5: float = 16.0
+    SWING_TP6: float = 20.0
 
-    ATR_PERIOD:      int   = 14
-    PRICE_DRIFT_MAX: float = 0.015
-    MAX_ATR_PCT:     float = 0.12
-    MIN_RR:          float = 0.6
-    MAX_SIZE_PCT:    float = 0.05
-    MAX_SIGNALS_PER_RUN: int = 15
-
-    # ── Signal Quality Thresholds ─────────────────────────────────────────────
-    # Swing
-    MIN_SCORE_10:     float = 0.45
-    MIN_EXPERT_VOTES: int   = 2
-    MIN_MTF:          float = 0.02
-    # Mixed
-    MIXED_MIN_SCORE:  float = 0.40
-    MIXED_MIN_VOTES:  int   = 2
-    MIXED_MIN_MTF:    float = 0.02
-    # Scalp
-    SCALP_MIN_SCORE:  float = 0.32
+    # ── Thresholds (Ultra-Relaxed per GAS v101) ───────────────────────
+    SWING_MIN_SCORE:  float = 2.5
+    SWING_MIN_VOTES:  int   = 3
+    SWING_MIN_MTF:    float = 0.03
+    SCALP_MIN_SCORE:  float = 2.0
     SCALP_MIN_VOTES:  int   = 2
-    SCALP_MIN_MTF:    float = 0.01
-    # NY Open Opportunity Window
-    OPP_WINDOW_SCORE: float = 0.20
-    OPP_WINDOW_VOTES: int   = 1
-    OPP_WINDOW_MTF:   float = 0.01
+    SCALP_MIN_MTF:    float = 0.02
+    OPP_SCORE:        float = 1.0
+    OPP_VOTES:        int   = 1
+    OPP_MTF:          float = 0.02
 
-    # ── Multi-Timeframe Weights ───────────────────────────────────────────────
-    MTF_W_5M:  float = 0.10
-    MTF_W_15M: float = 0.15
-    MTF_W_30M: float = 0.20
-    MTF_W_1H:  float = 0.25
-    MTF_W_4H:  float = 0.30
+    # ── MTF Weights ───────────────────────────────────────────────────
+    MTF_5M:  float = 0.10
+    MTF_15M: float = 0.15
+    MTF_30M: float = 0.20
+    MTF_1H:  float = 0.25
+    MTF_4H:  float = 0.30
 
-    # ── Cooldowns (seconds) ───────────────────────────────────────────────────
-    SCALP_COOLDOWN_SEC: int = 120
-    SWING_COOLDOWN_SEC: int = 600
-    STALE_MS:           int = 1_800_000   # 30 minutes
-    MAX_DAILY_LOSS_PCT: float = 0.15      # Hard stop at -15% daily
+    # ── Cooldowns ─────────────────────────────────────────────────────
+    SCALP_CD_SEC: int   = 120
+    SWING_CD_SEC: int   = 600
+    MAX_SIGNALS:  int   = 15
 
-    # ── QuickScalp Settings ───────────────────────────────────────────────────
-    QS_TRIGGER_SCORE:  float = 0.68
-    QS_COOLDOWN_MIN:   int   = 30
-    QS_MAX_PER_RUN:    int   = 3
-    QS_FIB_TOLERANCE:  float = 0.0012
-    QS_STALE_MS:       int   = 90_000     # 90 seconds
+    # ── Feature Flags ─────────────────────────────────────────────────
+    SHORT_SCALP_ONLY: bool = True
 
-    # ── SL Protection Layers ──────────────────────────────────────────────────
-    HARD_STOP_BUFFER:      float = 0.015   # 1.5%
-    EMERGENCY_BUFFER:      float = 0.030   # 3.0%
+    # ── AI Rate Limits (free tier) ────────────────────────────────────
+    # Grok free: ~30 req/min, 14,400/day
+    # Gemini Flash free: 15 req/min, 1,500/day
+    GROQ_MAX_PER_HOUR:   int = 25
+    GEMINI_MAX_PER_HOUR: int = 12
 
-    # ── Feature Flags ─────────────────────────────────────────────────────────
-    REQUIRE_4H_1H_ALIGN:         bool = False
-    BLOCK_COUNTER_TREND:         bool = False
-    SCALP_ONLY_OVERLAP:          bool = False
-    SCALP_ALLOW_MIXED_TREND:     bool = True
-    COUNTER_TREND_RSI_THRESHOLD: int  = 40
-    SHORT_SCALP_ONLY:            bool = True   # Shorts are scalp only
-
-    # ── Caching TTLs ─────────────────────────────────────────────────────────
-    BALANCE_CACHE_SEC:   int = 300
-    FUNDING_CACHE_SEC:   int = 600
-    SLOW_TF_CACHE_HRS:   int = 12
-    CME_GAP_CACHE_HRS:   int = 12
-    CME_GAP_MAGNET_PCT:  float = 0.005
-
-    # ── Indicator Weights (IW Engine) ─────────────────────────────────────────
-    IW: Dict[str, float] = field(default_factory=lambda: {
-        "ICHIMOKU_4H":   3.0,
-        "ADX_4H":        1.5,
-        "EMA_TREND_4H":  1.5,
-        "SUPERTREND_1H": 2.0,
-        "HA_1H":         1.5,
-        "RSI_DIV_1H":    1.5,
-        "RSI_5M":        1.0,
-        "MACD_5M":       1.0,
-        "BB_5M":         0.8,
-        "OBV_5M":        0.8,
-        "PSAR_5M":       0.7,
-        "PIVOT_1H":      1.0,
-        "CANDLE_5M":     0.8,
-        "STOCH_5M":      0.6,
-        "WR_5M":         0.5,
-    })
+    # ── QuickScalp ────────────────────────────────────────────────────
+    QS_SCORE:    float = 0.68
+    QS_FIB_TOL:  float = 0.0012
+    QS_MAX_RUN:  int   = 3
+    QS_CD_MIN:   int   = 30
 
 
-# ── Asset Volatility Profiles ─────────────────────────────────────────────────
-ASSET_VOLATILITY: Dict[str, VolProfile] = {
+ASSET_VOLATILITY: Dict[str, str] = {
     "BTC/USDT:USDT":  "LOW",
     "ETH/USDT:USDT":  "LOW",
     "SOL/USDT:USDT":  "HIGH",
@@ -234,75 +156,32 @@ ASSET_VOLATILITY: Dict[str, VolProfile] = {
     "XRP/USDT:USDT":  "MEDIUM",
 }
 
-VOL_THRESHOLDS: Dict[VolProfile, VolThreshold] = {
-    "LOW":       VolThreshold(min_score=0.30, min_votes=1, min_mtf=0.02, min_rr=0.8, max_atr=0.12),
-    "MEDIUM":    VolThreshold(min_score=0.30, min_votes=1, min_mtf=0.03, min_rr=0.8, max_atr=0.12),
-    "HIGH":      VolThreshold(min_score=0.40, min_votes=1, min_mtf=0.04, min_rr=0.9, max_atr=0.12),
-    "VERY_HIGH": VolThreshold(min_score=0.50, min_votes=2, min_mtf=0.05, min_rr=1.0, max_atr=0.12),
+VOL_THRESHOLDS: Dict[str, Dict] = {
+    "LOW":       {"min_score": 1.0, "min_votes": 1, "min_mtf": 0.02, "min_rr": 0.8},
+    "MEDIUM":    {"min_score": 1.5, "min_votes": 1, "min_mtf": 0.03, "min_rr": 0.8},
+    "HIGH":      {"min_score": 2.0, "min_votes": 1, "min_mtf": 0.04, "min_rr": 0.9},
+    "VERY_HIGH": {"min_score": 2.5, "min_votes": 2, "min_mtf": 0.05, "min_rr": 1.0},
 }
 
-# ── Portfolio Limits ──────────────────────────────────────────────────────────
-PORTFOLIO = {
-    "MAX_OPEN_TRADES":        15,
-    "MAX_DIRECTION_PCT":      0.70,
-    "MAX_CORR_TRADES":        10,
-    "MAX_TOTAL_EXPOSURE_PCT": 0.30,
+SCHEDULE: Dict[str, int] = {
+    "monitor_min": 1, "scalp_min": 5, "swing_hrs": 2, "super_swing_hrs": 4,
 }
 
-# ── Scheduler Intervals ───────────────────────────────────────────────────────
-SCHEDULE = {
-    "monitor_positions_min": 5,
-    "run_scalp_min":         15,
-    "run_swing_hrs":         2,
-    "run_super_swing_hrs":   4,
-    "daily_market_cron":     "0 0 * * *",    # midnight UTC
-    "weekly_report_cron":    "0 8 * * 1",    # Monday 08:00 UTC
-    "self_learn_cron":       "0 10 * * 0",   # Sunday 10:00 UTC
-}
-
-# ── Logging Configuration ─────────────────────────────────────────────────────
-LOG_CONFIG = {
-    "level":      os.environ.get("LOG_LEVEL", "INFO"),
-    "rotation":   "1 day",
-    "retention":  "7 days",
-    "log_dir":    Path(__file__).parent / "logs",
-}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 ── SINGLETON INSTANCE  (استخدم هذا في بقية الكود)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Create the single config instance used across the entire project
 CONFIG = BotConfig()
 
 
 def setup_logging() -> None:
-    """
-    Configure Loguru with file rotation and console output.
-    Call once in main.py before anything else runs.
-    """
-    log_dir = LOG_CONFIG["log_dir"]
+    log_dir = Path(__file__).parent / "logs"
     log_dir.mkdir(exist_ok=True)
-
-    # Remove default handler
     logger.remove()
-
-    # Console — clean and colorful
     logger.add(
-        sink=lambda msg: print(msg, end=""),
-        level=LOG_CONFIG["level"],
-        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan> — {message}",
+        sink=lambda m: print(m, end=""),
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | <cyan>{name}</cyan> — {message}",
         colorize=True,
     )
-
-    # File — rotating daily, kept 7 days
     logger.add(
         sink=str(log_dir / "ramos_{time:YYYY-MM-DD}.log"),
-        level="DEBUG",
-        rotation=LOG_CONFIG["rotation"],
-        retention=LOG_CONFIG["retention"],
-        encoding="utf-8",
+        level="DEBUG", rotation="1 day", retention="7 days", encoding="utf-8",
     )
-
-    logger.info(f"🚀 {CONFIG.NAME} {CONFIG.VERSION} — logging initialized")
+    logger.info(f"🚀 {CONFIG.NAME} {CONFIG.VERSION} — logging ready")
