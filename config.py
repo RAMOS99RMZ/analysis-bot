@@ -91,7 +91,7 @@ class BotConfig:
     MAX_SIZE_PCT:     float = 0.05
     PRICE_DRIFT_MAX:  float = 0.015
     MAX_DAILY_LOSS:   float = 0.15
-
+MAX_SIGNALS_PER_RUN: int = 5
     # ── Scalp ATR ─────────────────────────────────────────────────────
     ATR_SL:  float = 1.5
     ATR_TP1: float = 1.0
