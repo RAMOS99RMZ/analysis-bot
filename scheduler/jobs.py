@@ -1,3 +1,4 @@
+
 # scheduler/jobs.py
 # All timed jobs: scalp (15m), swing (2h), super-swing (4h),
 # monitor (5m), daily (00:00 UTC), weekly, heartbeat
