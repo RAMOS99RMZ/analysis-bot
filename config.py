@@ -97,6 +97,30 @@ class BotConfig:
     ATR_TP1: float = 1.0
     ATR_TP2: float = 2.0
     ATR_TP3: float = 3.0
+    ATR_MULT_SL:       float = 1.5
+    ATR_MULT_TP1:      float = 1.0
+    ATR_MULT_TP2:      float = 2.0
+    ATR_MULT_TP3:      float = 3.0
+
+    SWING_MULT_SL:     float = 2.0
+    SWING_MULT_TP1:    float = 2.5
+    SWING_MULT_TP2:    float = 5.0
+    SWING_MULT_TP3:    float = 8.0
+
+    SUPER_MULT_SL:     float = 3.0
+    SUPER_MULT_TP1:    float = 3.0
+    SUPER_MULT_TP2:    float = 5.0
+    SUPER_MULT_TP3:    float = 8.0
+
+    QS_MULT_SL:        float = 1.0
+    QS_MULT_TP1:       float = 0.8
+    QS_MULT_TP2:       float = 1.5
+    QS_MULT_TP3:       float = 2.5
+
+    MAX_DAILY_LOSS_PCT: float = 0.15
+    MIN_SCORE_THRESHOLD: float = 0.55
+    MIN_EXPERT_VOTES:   int   = 6
+    CIRCUIT_BREAKER_LOSSES: int = 3
 
     # ── Swing ATR ─────────────────────────────────────────────────────
     SWING_SL:  float = 2.0
