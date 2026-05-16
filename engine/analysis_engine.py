@@ -1,4 +1,3 @@
-
 """
 engine/analysis_engine.py — Ramos 360 Ai 🎖️
 E10: BTC + ETH deep analysis (1D/4H/1H) - real-time prices
@@ -90,23 +89,85 @@ async def _fetch_price(symbol: str) -> float:
 
 
 async def _fetch_macro() -> Dict:
-    """USDT.D + BTC.D from CoinGecko."""
+    """
+    Real-time USDT.D + BTC.D.
+    Strategy: compute dominance from LIVE market caps (Tether + Bitcoin)
+    against the global total — much more accurate than the cached
+    `market_cap_percentage` field on /global.
+    Fallback chain: CoinGecko-live → CoinGecko-global → CoinPaprika.
+    """
+    # ── Primary: live market caps via CoinGecko /simple/price ─────────
     try:
-        async with httpx.AsyncClient(timeout=12) as cl:
-            r = await cl.get("https://api.coingecko.com/api/v3/global",
-                             headers={"Accept": "application/json"})
-            if r.status_code == 200:
-                d = r.json().get("data", {})
-                dom = d.get("market_cap_percentage", {})
+        async with httpx.AsyncClient(timeout=12, headers=_HDR) as cl:
+            r1, r2 = await asyncio.gather(
+                cl.get(
+                    "https://api.coingecko.com/api/v3/simple/price",
+                    params={
+                        "ids": "tether,bitcoin",
+                        "vs_currencies": "usd",
+                        "include_market_cap": "true",
+                    },
+                ),
+                cl.get(
+                    "https://api.coingecko.com/api/v3/global",
+                    headers={"Accept": "application/json"},
+                ),
+            )
+            if r1.status_code == 200 and r2.status_code == 200:
+                p = r1.json()
+                g = r2.json().get("data", {})
+                total = float(g.get("total_market_cap", {}).get("usd", 0) or 0)
+                usdt_mc = float(p.get("tether",  {}).get("usd_market_cap", 0) or 0)
+                btc_mc  = float(p.get("bitcoin", {}).get("usd_market_cap", 0) or 0)
+                if total > 0 and usdt_mc > 0 and btc_mc > 0:
+                    return {
+                        "usdt_d":   round(usdt_mc / total * 100, 3),
+                        "btc_d":    round(btc_mc  / total * 100, 2),
+                        "total_mc": total,
+                        "ok": True,
+                        "source": "coingecko-live",
+                    }
+                # fallback to cached dominance field
+                dom = g.get("market_cap_percentage", {})
+                if dom:
+                    return {
+                        "usdt_d":   round(dom.get("usdt", 7.0), 3),
+                        "btc_d":    round(dom.get("btc",  50.0), 2),
+                        "total_mc": total,
+                        "ok": True,
+                        "source": "coingecko-cached",
+                    }
+    except Exception as e:
+        logger.warning(f"[Macro/CoinGecko] {e}")
+
+    # ── Fallback: CoinPaprika ─────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=_HDR) as cl:
+            g, t = await asyncio.gather(
+                cl.get("https://api.coinpaprika.com/v1/global"),
+                cl.get("https://api.coinpaprika.com/v1/tickers/usdt-tether"),
+            )
+            if g.status_code == 200:
+                gd = g.json()
+                total = float(gd.get("market_cap_usd", 0) or 0)
+                btc_d = float(gd.get("bitcoin_dominance_percentage", 50.0) or 50.0)
+                usdt_mc = 0.0
+                if t.status_code == 200:
+                    usdt_mc = float(
+                        t.json().get("quotes", {}).get("USD", {}).get("market_cap", 0) or 0
+                    )
+                usdt_d = round(usdt_mc / total * 100, 3) if (total > 0 and usdt_mc > 0) else 7.0
                 return {
-                    "usdt_d":   round(dom.get("usdt", 7.0), 3),
-                    "btc_d":    round(dom.get("btc",  50.0), 2),
-                    "total_mc": d.get("total_market_cap", {}).get("usd", 0),
+                    "usdt_d":   usdt_d,
+                    "btc_d":    round(btc_d, 2),
+                    "total_mc": total,
                     "ok": True,
+                    "source": "coinpaprika",
                 }
     except Exception as e:
-        logger.warning(f"[Macro] {e}")
-    return {"usdt_d": 7.0, "btc_d": 50.0, "total_mc": 0, "ok": False}
+        logger.warning(f"[Macro/CoinPaprika] {e}")
+
+    return {"usdt_d": 7.0, "btc_d": 50.0, "total_mc": 0, "ok": False, "source": "default"}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -667,121 +728,135 @@ def _de(d: str) -> str:
     return "🟢" if d == "BULL" else "🔴" if d == "BEAR" else "🟡"
 
 
+# ── Custom fib ratios for clean targets (per user spec) ───────────────
+_FIB_TARGET_RATIOS = [0.309, 0.4045, 0.618, 0.75, 0.809]
+
+
+def _smart_targets(direction: str, price: float, fib: Dict,
+                   gann: Dict, gann_a: Dict, pvt: Dict,
+                   smc: Dict, ema50: float, ema200: float,
+                   candle: Dict) -> List[Dict]:
+    """
+    Build clean directional targets using custom fib ratios:
+       0.309 · 0.4045 · 0.618 · 0.75 · 0.809
+    Then detect confluence with SMC / Gann Sq9 / Gann angles /
+    Pivot / EMA / candle pattern → mark as 💎 strong zone.
+    """
+    rng = float(fib.get("rng", 0) or 0)
+    if rng <= 0:
+        rng = price * 0.05  # safety fallback (5%)
+
+    # Build confluence pool (price, source label)
+    pool: List[Tuple[float, str]] = []
+    for g in (gann.get("levels") or [])[:30]:
+        pool.append((float(g), "Gann Sq9 ✨"))
+    if gann_a.get("angle_1x1"): pool.append((float(gann_a["angle_1x1"]), "زاوية 1×1 📐"))
+    if gann_a.get("angle_2x1"): pool.append((float(gann_a["angle_2x1"]), "زاوية 2×1 📐"))
+    if gann_a.get("angle_1x2"): pool.append((float(gann_a["angle_1x2"]), "زاوية 1×2 📐"))
+    for k in ("PP", "R1", "R2", "R3", "S1", "S2", "S3"):
+        if pvt.get(k): pool.append((float(pvt[k]), f"Pivot {k} 📌"))
+    if smc.get("ob_bull"): pool.append((float(smc["ob_bull"]["mid"]), "SMC OB دعم 🏛️"))
+    if smc.get("ob_bear"): pool.append((float(smc["ob_bear"]["mid"]), "SMC OB مقاومة 🏛️"))
+    if smc.get("liq_hi"):  pool.append((float(smc["liq_hi"]),  "SMC سيولة 💧"))
+    if smc.get("liq_lo"):  pool.append((float(smc["liq_lo"]),  "SMC سيولة 💧"))
+    if ema50:  pool.append((float(ema50),  "EMA50"))
+    if ema200: pool.append((float(ema200), "EMA200"))
+    if candle.get("name") and candle.get("bull") is not None:
+        # candle pattern adds bias confirmation around current price
+        pool.append((float(price), f"شمعة {candle['name']}"))
+
+    out: List[Dict] = []
+    for r in _FIB_TARGET_RATIOS:
+        if direction == "BULL":
+            lvl = price + rng * r
+            if lvl <= price * 1.001: continue
+        elif direction == "BEAR":
+            lvl = price - rng * r
+            if lvl >= price * 0.999 or lvl <= 0: continue
+        else:
+            continue
+
+        tol  = lvl * 0.006  # 0.6% confluence window
+        hits, seen = [], set()
+        for v, src in pool:
+            if abs(v - lvl) <= tol and src not in seen:
+                hits.append(src); seen.add(src)
+
+        out.append({
+            "price": round(lvl, 4),
+            "hits":  hits,
+            "strong": len(hits) >= 1,
+        })
+
+    # Deduplicate near-identical targets (within 0.4%)
+    dedup: List[Dict] = []
+    for t in out:
+        if not dedup or abs(t["price"] - dedup[-1]["price"]) / max(dedup[-1]["price"], 1) > 0.004:
+            dedup.append(t)
+    return dedup[:5]
+
+
 def _asset_msg(a: Dict) -> str:
-    sym  = a["symbol"].replace("/USDT:USDT","")
+    """
+    Clean & compact E10 message:
+      • Header (price + direction + confidence)
+      • Gann Sq9 + Gann angles only (no full TA dump)
+      • Directional targets (UP if BULL, DOWN if BEAR) — price-first,
+        with 💎 marker when fib confluences with SMC/Gann/Pivot/etc.
+      • Verdict: long-scalp/swing vs short-scalp
+    """
+    sym  = a["symbol"].replace("/USDT:USDT", "")
     icon = "₿" if "BTC" in sym else "Ξ"
-    p    = a["price"]; d = a["direction"]; c = a["confidence"]
-    r4   = a["rsi_4h"]; r1h = a["rsi_1h"]; r1d = a["rsi_1d"]
-    mac  = a["macd"]; bb = a["bb"]; obv = a["obv"]
-    st   = a["supertrend"]; ichi = a["ichimoku"]; ha = a["heikin_ashi"]
-    cnd  = a["candle"]; fib = a["fib"]; gann = a["gann"]
-    ga   = a["gann_angles"]; smc = a["smc"]; pvt = a["pivots"]
-    tgt  = a["targets"]
-    e20  = a["ema20"]; e50 = a["ema50"]; e200 = a["ema200"]
-    vwap = a["vwap"]; cmf  = a["cmf"]; stoch = a["stoch"]
+    p, d, c = a["price"], a["direction"], a["confidence"]
 
-    # EMA
-    if   p > e20 > e50 > e200: ema_l = "فوق 20/50/200 ✅"
-    elif p > e20 > e50:         ema_l = "فوق EMA20/50 🔼"
-    elif p < e20 < e50 < e200: ema_l = "تحت 20/50/200 ❌"
-    elif p < e20 < e50:         ema_l = "تحت EMA20/50 🔽"
-    else:                       ema_l = "متذبذب ↔️"
-
-    # Ichimoku
-    if   ichi["above"] and ichi["bull_cross"]:  ich_l = "فوق السحابة — صاعد قوي ✅"
-    elif ichi["above"]:                          ich_l = "فوق السحابة 🔼"
-    elif ichi["below"] and ichi["bear_cross"]:   ich_l = "تحت السحابة — هابط قوي ❌"
-    elif ichi["below"]:                          ich_l = "تحت السحابة 🔽"
-    else:                                        ich_l = "داخل السحابة ↔️"
-
-    # SuperTrend
-    if   st["bull_flip"]: st_l = "انعكاس للصعود 🚀"
-    elif st["bear_flip"]: st_l = "انعكاس للهبوط 💥"
-    elif st["bull"]:      st_l = "صاعد ✅"
-    else:                 st_l = "هابط ❌"
-
-    # Heikin Ashi
-    if   ha["strong_bull"]: ha_l = "صعود قوي (لا ظل سفلي) 🟢🔥"
-    elif ha["bull"]:         ha_l = "صعود 🟢"
-    elif ha["strong_bear"]:  ha_l = "هبوط قوي (لا ظل علوي) 🔴🔥"
-    else:                    ha_l = "هبوط 🔴"
-
-    # Fibonacci nearest
-    fn = fib.get("nearest", ("?",0))
-    fib_l = f"الأقرب: Fib {fn[0]}% @ {_f(fn[1])}" if isinstance(fn,tuple) else "—"
-
-    # Gann
+    # Gann digest
+    gann   = a["gann"]; ga = a["gann_angles"]
     g_near = _f(gann.get("nearest", p))
-    g_ang  = f"فوق 1×1 ✅ ({_f(ga.get('angle_1x1',0))})" if ga.get("above_1x1") \
-             else f"تحت 1×1 ⚠️ ({_f(ga.get('angle_1x1',0))})"
+    if ga.get("above_2x1"):   g_ang = f"فوق 2×1 🚀 ({_f(ga.get('angle_2x1', 0))})"
+    elif ga.get("above_1x1"): g_ang = f"فوق 1×1 ✅ ({_f(ga.get('angle_1x1', 0))})"
+    else:                     g_ang = f"تحت 1×1 ⚠️ ({_f(ga.get('angle_1x1', 0))})"
 
-    # SMC
-    smc_b  = {"BULL":"صاعد 🏛️","BEAR":"هابط 🏛️","NEUTRAL":"محايد ↔️"}.get(smc["bias"],"—")
-    smc_ex = ""
-    if smc["sweep_bull"]: smc_ex = " | Sweep القاع ✅"
-    if smc["sweep_bear"]: smc_ex = " | Sweep القمة ⚠️"
-    if smc.get("ob_bull"): smc_ex += f" | OB دعم {_f(smc['ob_bull']['mid'])}"
-    if smc.get("ob_bear"): smc_ex += f" | OB مقاومة {_f(smc['ob_bear']['mid'])}"
+    # Smart directional targets
+    targets = _smart_targets(
+        d, p, a["fib"], gann, ga, a["pivots"], a["smc"],
+        a["ema50"], a["ema200"], a["candle"],
+    )
 
-    # OBV
-    obv_l = ("تباعد إيجابي 🟢🔥" if obv["div_bull"] else
-             "حجم صاعد 📈"        if obv["rising"] else
-             "تباعد سلبي 🔴⚠️"   if obv["div_bear"] else "حجم هابط 📉")
+    if d == "BULL":
+        tgt_header = "🎯 <b>أهداف الصعود:</b>"
+        verd_emoji, verd_txt = "🟢", "ترند صاعد"
+        action = "🚀 <b>ابحث عن صفقات LONG (Scalp + Swing)</b>"
+    elif d == "BEAR":
+        tgt_header = "🛡️ <b>أهداف الهبوط:</b>"
+        verd_emoji, verd_txt = "🔴", "ترند هابط"
+        action = "📉 <b>ابحث عن صفقات SHORT (Scalp)</b>"
+    else:
+        tgt_header = "📊 <b>نطاقات متوقعة:</b>"
+        verd_emoji, verd_txt = "🟡", "محايد"
+        action = "⏸️ <b>انتظر تأكيداً قبل الدخول</b>"
 
-    # CMF
-    cmf_l = f"{cmf:+.3f} ({'تدفق شراء ✅' if cmf>0.1 else 'تدفق بيع ❌' if cmf<-0.1 else 'محايد'})"
-
-    # Stochastic
-    sto_l = f"{stoch['k']:.0f} — {'تشبع بيع 🔵' if stoch['oversold'] else 'تشبع شراء 🔴' if stoch['overbought'] else 'طبيعي'}"
-
-    # Pivot position
-    pvt_l = f"فوق PP ({_f(pvt.get('PP',0))})" if pvt.get("PP") and p > pvt["PP"] else \
-            f"تحت PP ({_f(pvt.get('PP',0))})" if pvt.get("PP") else "—"
-
-    # VWAP
-    vwap_l = f"{'فوق ✅' if p > vwap else 'تحت ⚠️'} VWAP {_f(vwap)}"
-
-    # BB
-    if   p >= bb["upper"]: bb_l = f"عند الحد العلوي 🔴 {_f(bb['upper'])}"
-    elif p <= bb["lower"]: bb_l = f"عند الحد السفلي 🟢 {_f(bb['lower'])}"
-    else:                  bb_l = f"داخل النطاق | Mid: {_f(bb['mid'])}"
-
-    # Targets
-    r_lines = [f"  🎯 R{i+1}: {_f(l)} ← {s}"
-               for i,(l,s) in enumerate(tgt.get("resistances",[])[:3])]
-    s_lines = [f"  🛡️ S{i+1}: {_f(l)} ← {s}"
-               for i,(l,s) in enumerate(tgt.get("supports",[])[:3])]
-
-    # Verdict
-    if   d == "BULL": verd = f"🟢 <b>ترند صاعد — ثقة {c}%</b>\n  ✅ ابحث عن صفقات LONG"
-    elif d == "BEAR": verd = f"🔴 <b>ترند هابط — ثقة {c}%</b>\n  ✅ ابحث عن صفقات SHORT"
-    else:             verd = f"🟡 <b>محايد — انتظر تأكيداً</b>"
+    if targets:
+        tgt_lines = []
+        for i, t in enumerate(targets, 1):
+            emoji = "💎" if t["strong"] else "🎯"
+            line  = f"  {emoji} T{i}: {_f(t['price'])}"
+            if t["hits"]:
+                line += f"  ← {' + '.join(t['hits'][:2])}"
+            tgt_lines.append(line)
+        if any(x["strong"] for x in targets):
+            tgt_lines.append("  <i>💎 = نطاق قوي (توافق فيبوناتشي + مدرسة أخرى)</i>")
+    else:
+        tgt_lines = ["  — لا توجد أهداف واضحة في الإطار الحالي"]
 
     return (
         f"{'━'*32}\n"
         f"{icon} <b>{sym}/USDT</b>  ·  {_f(p)}\n"
         f"{_de(d)} الاتجاه: <b>{d}</b>  |  ثقة: <b>{c}%</b>\n\n"
-        f"<b>📋 التحليل الفني (1D / 4H / 1H):</b>\n"
-        f"  📊 RSI:        4H={r4:.0f}  1H={r1h:.0f}  1D={r1d:.0f}\n"
-        f"  📉 MACD:       {'صاعد ✅' if mac['bull'] else 'هابط ❌'} (hist={mac['hist']:+.5f})\n"
-        f"  📊 EMA:        {ema_l}\n"
-        f"  ☁️ Ichimoku:   {ich_l}\n"
-        f"  🔄 SuperTrend: {st_l}\n"
-        f"  🕯️ Heikin Ashi:{ha_l}\n"
-        f"  🎯 BB:         {bb_l}\n"
-        f"  📈 OBV:        {obv_l}\n"
-        f"  💧 CMF:        {cmf_l}\n"
-        f"  📊 Stoch:      {sto_l}\n"
-        f"  💹 VWAP:       {vwap_l}\n"
-        f"  📌 Pivot:      {pvt_l}\n"
-        f"  🎯 Fibonacci:  {fib_l}\n"
-        f"  ✨ Gann Sq9:   أقرب مستوى = {g_near}\n"
-        f"  📐 Gann زوايا: {g_ang}\n"
-        f"  🏛️ SMC:        {smc_b}{smc_ex}\n"
-        f"  🕯️ الشمعة:    {cnd['name']}\n\n"
-        f"<b>🎯 أهداف الصعود (مقاومات):</b>\n" + "\n".join(r_lines) + "\n\n"
-        f"<b>🛡️ أهداف الهبوط (دعوم):</b>\n"   + "\n".join(s_lines) + "\n\n"
-        f"<b>🏁 الخلاصة:</b> {verd}"
+        f"✨ <b>Gann Sq9:</b>     أقرب مستوى {g_near}\n"
+        f"📐 <b>زوايا Gann:</b>  {g_ang}\n\n"
+        f"{tgt_header}\n" + "\n".join(tgt_lines) + "\n\n"
+        f"🏁 <b>الخلاصة:</b> {verd_emoji} {verd_txt} — ثقة {c}%\n"
+        f"{action}"
     )
 
 
@@ -957,17 +1032,19 @@ async def run_full_analysis(db: Any, notifier: Any, fetcher: Any) -> Dict:
     if results.get("BTC"): parts.append(_asset_msg(results["BTC"]))
     if results.get("ETH"): parts.append(_asset_msg(results["ETH"]))
     parts.append(_e11_msg(e11, usdt_d_now, btc_d, now_str))
-    parts.append(
-        f"{'━'*32}\n"
-        f"💾 النتائج محفوظة — الخبراء الآخرون سيقرؤها\n"
-        f"<i>🎖️ Ramos 360 Ai — E10+E11</i>"
-    )
-
-    # Send each section separately (avoid 4096 limit)
+    # ── Send each section to Telegram (skip the internal "saved" footer) ──
+    # NOTE: data is persisted in Supabase via db.log_regime() above —
+    # other experts will read it from DB. No need to spam Telegram with it.
     for part in parts:
         if part.strip():
             await notifier.send(part)
             await asyncio.sleep(0.8)
 
-    logger.success(f"[Analysis] ✅ Done — {len([k for k in results if k!='USDT_D'])} assets")
+    logger.info(
+        f"[Analysis] 💾 Results persisted to DB — "
+        f"{len([k for k in results if k != 'USDT_D'])} assets available for other experts"
+    )
+    logger.success(
+        f"[Analysis] ✅ Done — {len([k for k in results if k != 'USDT_D'])} assets sent"
+    )
     return results
