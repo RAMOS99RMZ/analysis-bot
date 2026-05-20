@@ -1,7 +1,7 @@
+
 """
 config.py — Ramos 360 Ai 🎖️
-Central configuration. ALL secrets from environment variables only.
-OKX keys are OPTIONAL — bot runs market analysis without them.
+✅ FIXED: Thresholds calibrated for weighted score system (0.0-1.0)
 """
 from __future__ import annotations
 import os
@@ -15,24 +15,16 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SECRETS — 100% from environment, zero hardcoding
+# SECRETS
 # ══════════════════════════════════════════════════════════════════════
-
 class Secrets:
-    # ── Telegram (mandatory) ────────────────────────────────────────
     BOT_TOKEN:    str = os.getenv("BOT_TOKEN",    "")
     CHAT_ID:      str = os.getenv("CHAT_ID",      "")
-
-    # ── Supabase (mandatory) ─────────────────────────────────────────
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
     SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
-
-    # ── OKX (OPTIONAL — public market data works without keys) ───────
     OKX_KEY:      str = os.getenv("OKX_KEY",      "")
     OKX_SECRET:   str = os.getenv("OKX_SECRET",   "")
     OKX_PASS:     str = os.getenv("OKX_PASS",     "")
-
-    # ── AI APIs (optional, rate-limited on free tier) ─────────────────
     GROQ_KEY:     str = os.getenv("GROQ_KEY",     "")
     GEMINI_KEY:   str = os.getenv("GEMINI_KEY",   "")
 
@@ -42,18 +34,15 @@ class Secrets:
                      "SUPABASE_URL": cls.SUPABASE_URL, "SUPABASE_KEY": cls.SUPABASE_KEY}
         missing = [k for k, v in mandatory.items() if not v]
         if missing:
-            raise RuntimeError(f"❌ Missing secrets: {missing} — add to GitHub Secrets")
-
-        # OKX is optional
+            raise RuntimeError(f"❌ MISSING MANDATORY SECRETS: {missing}\n"
+                               "Add them to your .env file or GitHub Actions secrets.")
         if not cls.OKX_KEY:
             logger.warning("⚠️  OKX keys not set — using public data only (no live trading)")
-
-        # AI keys optional
-        missing_ai = [k for k, v in {"GROQ_KEY": cls.GROQ_KEY, "GEMINI_KEY": cls.GEMINI_KEY}.items() if not v]
+        missing_ai = [k for k, v in {"GROQ_KEY": cls.GROQ_KEY,
+                                      "GEMINI_KEY": cls.GEMINI_KEY}.items() if not v]
         if missing_ai:
             logger.warning(f"⚠️  AI keys not set: {missing_ai} — AI confirmation disabled")
-
-        logger.info("✅ Secrets validated.")
+        logger.info("✅ All mandatory secrets loaded successfully.")
 
     @classmethod
     def has_okx(cls) -> bool:
@@ -69,13 +58,12 @@ class Secrets:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# BOT CONFIG — migrated 1:1 from GAS CONFIG object
+# BOT CONFIG
 # ══════════════════════════════════════════════════════════════════════
-
 @dataclass(frozen=True)
 class BotConfig:
     NAME:    str = "Ramos 360 Ai 🎖️"
-    VERSION: str = "v101 Python"
+    VERSION: str = "v102 Python"
 
     ASSETS: List[str] = field(default_factory=lambda: [
         "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
@@ -87,60 +75,66 @@ class BotConfig:
     SLIPPAGE_PCT:     float = 0.0005
     ATR_PERIOD:       int   = 14
     MAX_ATR_PCT:      float = 0.12
-    MIN_RR:           float = 0.8
+    MIN_RR:           float = 0.7       # ✅ خُفِّف من 0.8 → 0.7
     MAX_SIZE_PCT:     float = 0.05
     PRICE_DRIFT_MAX:  float = 0.015
     MAX_DAILY_LOSS:   float = 0.15
+    MAX_DAILY_LOSS_PCT: float = 0.15   # alias
     MAX_SIGNALS_PER_RUN: int = 5
-    # ── Scalp ATR ─────────────────────────────────────────────────────
-    ATR_SL:  float = 1.5
-    ATR_TP1: float = 1.0
-    ATR_TP2: float = 2.0
-    ATR_TP3: float = 3.0
-    ATR_MULT_SL:       float = 1.5
-    ATR_MULT_TP1:      float = 1.0
-    ATR_MULT_TP2:      float = 2.0
-    ATR_MULT_TP3:      float = 3.0
+    MAX_SIGNALS:      int   = 15
 
-    SWING_MULT_SL:     float = 2.0
-    SWING_MULT_TP1:    float = 2.5
-    SWING_MULT_TP2:    float = 5.0
-    SWING_MULT_TP3:    float = 8.0
+    # ── ATR Multipliers ───────────────────────────────────────────────
+    ATR_SL:       float = 1.5
+    ATR_TP1:      float = 1.0
+    ATR_TP2:      float = 2.0
+    ATR_TP3:      float = 3.0
+    ATR_MULT_SL:  float = 1.5
+    ATR_MULT_TP1: float = 1.0
+    ATR_MULT_TP2: float = 2.0
+    ATR_MULT_TP3: float = 3.0
 
-    SUPER_MULT_SL:     float = 3.0
-    SUPER_MULT_TP1:    float = 3.0
-    SUPER_MULT_TP2:    float = 5.0
-    SUPER_MULT_TP3:    float = 8.0
+    SWING_SL:      float = 2.0
+    SWING_TP1:     float = 2.5
+    SWING_TP2:     float = 5.0
+    SWING_TP3:     float = 8.0
+    SWING_TP4:     float = 12.0
+    SWING_TP5:     float = 16.0
+    SWING_TP6:     float = 20.0
+    SWING_MULT_SL:  float = 2.0
+    SWING_MULT_TP1: float = 2.5
+    SWING_MULT_TP2: float = 5.0
+    SWING_MULT_TP3: float = 8.0
 
-    QS_MULT_SL:        float = 1.0
-    QS_MULT_TP1:       float = 0.8
-    QS_MULT_TP2:       float = 1.5
-    QS_MULT_TP3:       float = 2.5
+    SUPER_MULT_SL:  float = 3.0
+    SUPER_MULT_TP1: float = 3.0
+    SUPER_MULT_TP2: float = 5.0
+    SUPER_MULT_TP3: float = 8.0
 
-    MAX_DAILY_LOSS_PCT: float = 0.15
-    MIN_SCORE_THRESHOLD: float = 0.55
-    MIN_EXPERT_VOTES:   int   = 6
-    CIRCUIT_BREAKER_LOSSES: int = 3
+    QS_MULT_SL:     float = 1.0
+    QS_MULT_TP1:    float = 0.8
+    QS_MULT_TP2:    float = 1.5
+    QS_MULT_TP3:    float = 2.5
 
-    # ── Swing ATR ─────────────────────────────────────────────────────
-    SWING_SL:  float = 2.0
-    SWING_TP1: float = 2.5
-    SWING_TP2: float = 5.0
-    SWING_TP3: float = 8.0
-    SWING_TP4: float = 12.0
-    SWING_TP5: float = 16.0
-    SWING_TP6: float = 20.0
-
-    # ── Thresholds (Ultra-Relaxed per GAS v101) ───────────────────────
-    SWING_MIN_SCORE:  float = 2.5
-    SWING_MIN_VOTES:  int   = 3
-    SWING_MIN_MTF:    float = 0.03
-    SCALP_MIN_SCORE:  float = 2.0
+    # ══════════════════════════════════════════════════════════════════
+    # ✅ THRESHOLDS — مُعايَرة للنظام الجديد (نطاق 0.0-1.0)
+    # المشكلة الجذرية: القيم القديمة (2.0, 2.5) كانت مستحيلة
+    # النظام الجديد: weighted average → max ≈ 0.70
+    # ══════════════════════════════════════════════════════════════════
+    SCALP_MIN_SCORE:  float = 0.25   # ✅ كان 2.0 → مستحيل
     SCALP_MIN_VOTES:  int   = 2
     SCALP_MIN_MTF:    float = 0.02
-    OPP_SCORE:        float = 1.0
+
+    SWING_MIN_SCORE:  float = 0.30   # ✅ كان 2.5 → مستحيل
+    SWING_MIN_VOTES:  int   = 3
+    SWING_MIN_MTF:    float = 0.02
+
+    OPP_SCORE:        float = 0.15   # ✅ كان 1.0 → مستحيل
     OPP_VOTES:        int   = 1
-    OPP_MTF:          float = 0.02
+    OPP_MTF:          float = 0.01
+
+    MIN_SCORE_THRESHOLD:  float = 0.25
+    MIN_EXPERT_VOTES:     int   = 2
+    CIRCUIT_BREAKER_LOSSES: int = 3
 
     # ── MTF Weights ───────────────────────────────────────────────────
     MTF_5M:  float = 0.10
@@ -150,26 +144,26 @@ class BotConfig:
     MTF_4H:  float = 0.30
 
     # ── Cooldowns ─────────────────────────────────────────────────────
-    SCALP_CD_SEC: int   = 120
-    SWING_CD_SEC: int   = 600
-    MAX_SIGNALS:  int   = 15
+    SCALP_CD_SEC: int = 120
+    SWING_CD_SEC: int = 600
 
     # ── Feature Flags ─────────────────────────────────────────────────
     SHORT_SCALP_ONLY: bool = True
 
-    # ── AI Rate Limits (free tier) ────────────────────────────────────
-    # Grok free: ~30 req/min, 14,400/day
-    # Gemini Flash free: 15 req/min, 1,500/day
+    # ── AI Rate Limits ────────────────────────────────────────────────
     GROQ_MAX_PER_HOUR:   int = 25
     GEMINI_MAX_PER_HOUR: int = 12
 
     # ── QuickScalp ────────────────────────────────────────────────────
-    QS_SCORE:    float = 0.68
-    QS_FIB_TOL:  float = 0.0012
-    QS_MAX_RUN:  int   = 3
-    QS_CD_MIN:   int   = 30
+    QS_SCORE:   float = 0.25   # ✅ كان 0.68 → خُفِّف
+    QS_FIB_TOL: float = 0.0012
+    QS_MAX_RUN: int   = 3
+    QS_CD_MIN:  int   = 30
 
 
+# ══════════════════════════════════════════════════════════════════════
+# ✅ VOL_THRESHOLDS — مُعايَرة للنظام الجديد
+# ══════════════════════════════════════════════════════════════════════
 ASSET_VOLATILITY: Dict[str, str] = {
     "BTC/USDT:USDT":  "LOW",
     "ETH/USDT:USDT":  "LOW",
@@ -181,10 +175,11 @@ ASSET_VOLATILITY: Dict[str, str] = {
 }
 
 VOL_THRESHOLDS: Dict[str, Dict] = {
-    "LOW":       {"min_score": 1.0, "min_votes": 1, "min_mtf": 0.02, "min_rr": 0.8},
-    "MEDIUM":    {"min_score": 1.5, "min_votes": 1, "min_mtf": 0.03, "min_rr": 0.8},
-    "HIGH":      {"min_score": 2.0, "min_votes": 1, "min_mtf": 0.04, "min_rr": 0.9},
-    "VERY_HIGH": {"min_score": 2.5, "min_votes": 2, "min_mtf": 0.05, "min_rr": 1.0},
+    # ✅ min_score كانت 1.0/1.5/2.0/2.5 → مستحيلة، الآن 0.15-0.30
+    "LOW":       {"min_score": 0.15, "min_votes": 1, "min_mtf": 0.01, "min_rr": 0.7},
+    "MEDIUM":    {"min_score": 0.20, "min_votes": 1, "min_mtf": 0.02, "min_rr": 0.7},
+    "HIGH":      {"min_score": 0.25, "min_votes": 2, "min_mtf": 0.02, "min_rr": 0.8},
+    "VERY_HIGH": {"min_score": 0.30, "min_votes": 2, "min_mtf": 0.03, "min_rr": 0.9},
 }
 
 SCHEDULE: Dict[str, int] = {
@@ -201,7 +196,11 @@ def setup_logging() -> None:
     logger.add(
         sink=lambda m: print(m, end=""),
         level=os.getenv("LOG_LEVEL", "INFO"),
-        format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | <cyan>{name}</cyan> — {message}",
+        format=(
+            "<green>{time:HH:mm:ss}</green> | "
+            "<level>{level:<8}</level> | "
+            "<cyan>{name}</cyan> — {message}"
+        ),
         colorize=True,
     )
     logger.add(
