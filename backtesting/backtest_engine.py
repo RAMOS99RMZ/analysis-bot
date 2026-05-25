@@ -1,7 +1,7 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  backtesting/backtest_engine.py  —  Ramos 360 Ai Custom Backtester          ║
 # ║                                                                              ║
-# ║  الحل الجذري والنهائي: معالجة ذكية لأعمدة الوقت والأسعار القادمة من OKX       ║
+# ║  الحل الجذري النهائي: دعم كامل للمصفوفات الرقمية الخام القادمة من OKX       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 from __future__ import annotations
 from typing import Dict, List, Optional
@@ -23,9 +23,9 @@ class BacktestEngine:
     # ── Data fetching ─────────────────────────────────────────────────────────
     async def _fetch_range(self, symbol: str, timeframe: str,
                            start: datetime, end: datetime) -> pd.DataFrame:
-        """Fetch OHLCV using the bot's custom get_candles optimized for OKX with robust column matching."""
+        """Fetch OHLCV using the bot's custom get_candles and map the raw OKX array structure."""
         try:
-            # استدعاء دالة البوت لجلب الشموع التاريخية
+            # استدعاء دالة البوت لجلب الشموع التاريخية من OKX
             candles = await self.fetcher.get_candles(symbol=symbol, timeframe=timeframe, limit=1000)
             
             if not candles or len(candles) == 0:
@@ -35,44 +35,40 @@ class BacktestEngine:
             # تحويل البيانات القادمة إلى Pandas DataFrame
             df = pd.DataFrame(candles)
             
-            # 1. حل مشكلة عمود الوقت بذكاء (البحث بكافة الصيغ الممكنة للـ Timestamp)
-            time_col = None
-            for col in df.columns:
-                if str(col).lower() in ["timestamp", "time", "ts", "date", "dt"]:
-                    time_col = col
-                    break
-            
-            if time_col:
-                # إذا وجدنا عمود الوقت نقوم بتحويله إلى صيغة تاريخية وجعله الفهرس
-                df["dt"] = pd.to_datetime(df[time_col])
-                df.set_index("dt", inplace=True)
-            elif isinstance(df.index, pd.DatetimeIndex):
-                # إذا كانت البيانات قادمة والوقت مجهز مسبقاً كفهرس (Index)
-                pass
+            # إذا كانت الأعمدة عبارة عن أرقام خامة [0, 1, 2, 3, 4, 5] مثل القادمة من OKX API
+            if list(df.columns) == [0, 1, 2, 3, 4, 5] or len(df.columns) >= 6:
+                # إعطاء مسميات صريحة وصحيحة للأعمدة حسب ترتيب OKX القياسي
+                df.columns = ["timestamp", "open", "high", "low", "close", "vol"] + list(df.columns[6:])
             else:
-                logger.error(f"[BT] Could not find any time/timestamp column. Columns available: {list(df.columns)}")
+                # إذا كانت الأعمدة قادمة بأسماء نصوص، نوحد الحروف الصغيرة
+                rename_map = {}
+                for col in df.columns:
+                    c_low = str(col).lower()
+                    if c_low in ["timestamp", "time", "ts", "date", "dt"]:
+                        rename_map[col] = "timestamp"
+                    elif c_low in ["open", "high", "low", "close"]:
+                        rename_map[col] = c_low
+                    elif c_low in ["volume", "vol"]:
+                        rename_map[col] = "vol"
+                if rename_map:
+                    df.rename(columns=rename_map, inplace=True)
+
+            # التأكد من وجود عمود الوقت وإعداده كفهرس للمصفوفة
+            if "timestamp" in df.columns:
+                df["dt"] = pd.to_datetime(df["timestamp"])
+                df.set_index("dt", inplace=True)
+            elif not isinstance(df.index, pd.DatetimeIndex):
+                logger.error(f"[BT] Could not process time index. Columns: {list(df.columns)}")
                 return pd.DataFrame()
 
-            # 2. توحيد مسميات أعمدة الأسعار لتكون بحروف صغيرة ومتوافقة تماماً مع عمليات المحرك الحسابية
-            rename_map = {}
-            for col in df.columns:
-                c_low = str(col).lower()
-                if c_low in ["open", "high", "low", "close"]:
-                    rename_map[col] = c_low
-                elif c_low in ["volume", "vol"]:
-                    rename_map[col] = "vol"
-            
-            if rename_map:
-                df.rename(columns=rename_map, inplace=True)
-
-            # التأكد من وجود كافة الأعمدة الأساسية المطلوبة بعد التوحيد
+            # التأكد من وجود كافة الأعمدة الأساسية للأسعار بعد التسمية
             required_cols = ["open", "high", "low", "close", "vol"]
             for col in required_cols:
                 if col not in df.columns:
-                    logger.error(f"[BT] Missing required price column '{col}' after normalization. Available: {list(df.columns)}")
+                    logger.error(f"[BT] Missing price column '{col}'. Available: {list(df.columns)}")
                     return pd.DataFrame()
 
-            # تحويل كافة قيم الأسعار والحجم إلى أرقام عشرية (Float) لضمان دقة العمليات الرياضية
+            # تحويل قيم الأسعار والحجم إلى أرقام عشرية (Float) لضمان دقة الرياضيات والمؤشرات
             for col in required_cols:
                 df[col] = df[col].astype(float)
             
@@ -84,7 +80,7 @@ class BacktestEngine:
             return df
 
         except Exception as e:
-            logger.error(f"[BT] Error in robust _fetch_range: {e}")
+            logger.error(f"[BT] Error in robust raw _fetch_range: {e}")
             return pd.DataFrame()
 
     # ── Core simulation ───────────────────────────────────────────────────────
@@ -178,9 +174,9 @@ class BacktestEngine:
         end   = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
         out: Dict[str, Dict] = {}
         for sym in symbols:
-            logger.info(f"[BT] Requesting custom candles for {sym} ({timeframe})...")
+            logger.info(f"[BT] Requesting custom OKX candles for {sym} ({timeframe})...")
             df = await self._fetch_range(sym, timeframe, start, end)
-            logger.info(f"[BT] {sym}: {len(df)} historical candles matched the timeframe")
+            logger.info(f"[BT] {sym}: {len(df)} historical candles mapped successfully")
             res = self._simulate(df)
             out[sym] = res
         return {
