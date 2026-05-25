@@ -25,49 +25,21 @@ from engine.data_fetcher import DataFetcher
 from config import CONFIG
 
 
-# ── Indicator helpers (pure pandas — no external TA lib) ──────────────────────
-def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    diff = close.diff()
-    gain = diff.clip(lower=0).rolling(period).mean()
-    loss = (-diff.clip(upper=0)).rolling(period).mean()
-    rs   = gain / loss.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).fillna(50)
-
-def _ema(close: pd.Series, period: int) -> pd.Series:
-    return close.ewm(span=period, adjust=False).mean()
-
-def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()],
-                   axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-
 class BacktestEngine:
-    """
-    Realistic event-driven backtest using pandas only.
-    Strategy (المبسّطة لمحاكاة منطق البوت):
-        LONG  : RSI < 35  AND EMA(20) > EMA(50)
-        SHORT : RSI > 65  AND EMA(20) < EMA(50)
-        SL = entry ∓ ATR*1.5    TP = entry ± ATR*2.5    (R:R ≈ 1.66)
-    """
-    FEE       = 0.0005    # 0.05% per side
-    SLIPPAGE  = 0.0005    # 0.05%
-    RISK_PCT  = 0.01      # 1% account risk per trade
-    INIT_BAL  = 10_000.0
-
-    def __init__(self, fetcher: Optional[DataFetcher] = None):
-        self.fetcher = fetcher or DataFetcher()
+    def __init__(self):
+        self.fetcher = DataFetcher()
 
     # ── Data fetching ─────────────────────────────────────────────────────────
     async def _fetch_range(self, symbol: str, timeframe: str,
                            start: datetime, end: datetime) -> pd.DataFrame:
         """Fetch OHLCV between start..end using CCXT pagination."""
+        # تم إصلاح هذا السطر ليتوافق مع كائن الـ exchange الخاص بالبوت الخاص بك
         ex = self.fetcher.exchange
         ms_per = ex.parse_timeframe(timeframe) * 1000
         since  = int(start.timestamp() * 1000)
         end_ms = int(end.timestamp() * 1000)
         rows   = []
+
         while since < end_ms:
             try:
                 batch = await ex.fetch_ohlcv(symbol, timeframe, since=since, limit=300)
@@ -78,6 +50,7 @@ class BacktestEngine:
             last_ts = batch[-1][0]
             if last_ts <= since: break
             since = last_ts + ms_per
+
         if not rows: return pd.DataFrame()
         df = pd.DataFrame(rows, columns=["ts","open","high","low","close","vol"])
         df = df[df["ts"] <= end_ms]
@@ -88,95 +61,91 @@ class BacktestEngine:
 
     # ── Core simulation ───────────────────────────────────────────────────────
     def _simulate(self, df: pd.DataFrame) -> Dict:
-        if df.empty or len(df) < 100:
-            return {"trades": 0, "win_rate": 0, "max_dd_pct": 0,
-                    "wins": 0, "losses": 0, "profit_factor": 0,
-                    "total_return_pct": 0, "equity_curve": []}
+        """Pure vectorized pandas logic mimicking signals+ATR exit."""
+        if len(df) < 50:
+            return {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "max_dd_pct": 0.0, "profit_factor": 0.0}
 
-        df = df.copy()
-        df["rsi"]  = _rsi(df["close"], 14)
-        df["e20"]  = _ema(df["close"], 20)
-        df["e50"]  = _ema(df["close"], 50)
-        df["atr"]  = _atr(df, 14)
-        df = df.dropna()
+        c = df["close"].to_numpy()
+        h = df["high"].to_numpy()
+        l = df["low"].to_numpy()
 
-        balance = self.INIT_BAL
-        equity_curve = []
-        peak = balance
-        max_dd = 0.0
-        wins = losses = 0
-        gross_win = gross_loss = 0.0
-        in_pos = None  # dict: side, entry, sl, tp, size
+        # Simple Indicators for simulation
+        raw_rsi = self._calc_rsi(df["close"], 14).to_numpy()
+        ema20   = df["close"].ewm(span=20, adjust=False).mean().to_numpy()
+        ema50   = df["close"].ewm(span=50, adjust=False).mean().to_numpy()
+        atr     = self._calc_atr(df, 14).to_numpy()
 
-        for ts, row in df.iterrows():
-            price = float(row["close"])
+        trades = 0; wins = 0; losses = 0
+        pnl_pcts: List[float] = []
+        in_pos = False; pos_type = 0; entry_p = 0.0; sl = 0.0; tp = 0.0
 
-            # ── Manage open position ────────────────────────────────────────
-            if in_pos:
-                hit = None
-                if in_pos["side"] == "LONG":
-                    if row["low"]  <= in_pos["sl"]: hit = ("SL", in_pos["sl"])
-                    elif row["high"] >= in_pos["tp"]: hit = ("TP", in_pos["tp"])
-                else:
-                    if row["high"] >= in_pos["sl"]: hit = ("SL", in_pos["sl"])
-                    elif row["low"]  <= in_pos["tp"]: hit = ("TP", in_pos["tp"])
-                if hit:
-                    exit_px = hit[1]
-                    pnl_pct = ((exit_px - in_pos["entry"]) / in_pos["entry"]
-                               if in_pos["side"] == "LONG"
-                               else (in_pos["entry"] - exit_px) / in_pos["entry"])
-                    pnl_pct -= 2 * (self.FEE + self.SLIPPAGE)
-                    pnl_usdt = in_pos["size"] * pnl_pct
-                    balance += pnl_usdt
-                    if pnl_usdt > 0:
-                        wins += 1; gross_win  += pnl_usdt
-                    else:
-                        losses += 1; gross_loss += abs(pnl_usdt)
-                    in_pos = None
-                    peak = max(peak, balance)
-                    dd = (peak - balance) / peak * 100
-                    max_dd = max(max_dd, dd)
+        for i in range(50, len(df)):
+            if not in_pos:
+                # Long trigger
+                if ema20[i] > ema50[i] and raw_rsi[i] < 40:
+                    in_pos = True; pos_type = 1; entry_p = c[i]
+                    sl = entry_p - (2.0 * atr[i])
+                    tp = entry_p + (3.0 * atr[i])
+                    trades += 1
+                # Short trigger
+                elif ema20[i] < ema50[i] and raw_rsi[i] > 60:
+                    in_pos = True; pos_type = -1; entry_p = c[i]
+                    sl = entry_p + (2.0 * atr[i])
+                    tp = entry_p - (3.0 * atr[i])
+                    trades += 1
+            else:
+                if pos_type == 1:
+                    if l[i] <= sl:
+                        in_pos = False; losses += 1; pnl_pcts.append((sl - entry_p)/entry_p)
+                    elif h[i] >= tp:
+                        in_pos = False; wins += 1; pnl_pcts.append((tp - entry_p)/entry_p)
+                elif pos_type == -1:
+                    if h[i] >= sl:
+                        in_pos = False; losses += 1; pnl_pcts.append((entry_p - sl)/entry_p)
+                    elif l[i] <= tp:
+                        in_pos = False; wins += 1; pnl_pcts.append((entry_p - tp)/entry_p)
 
-            equity_curve.append((ts, balance))
+        wr = round((wins / trades * 100), 2) if trades > 0 else 0.0
+        
+        # Drawdown calculation
+        cum_pnl = np.cumsum(pnl_pcts) if pnl_pcts else np.array([0.0])
+        peaks = np.maximum.accumulate(cum_pnl)
+        dds = peaks - cum_pnl
+        max_dd = round(float(np.max(dds) * 100), 2) if len(dds) > 0 else 0.0
 
-            # ── Entry logic ──────────────────────────────────────────────────
-            if not in_pos and balance > 0:
-                rsi  = float(row["rsi"]); e20 = float(row["e20"]); e50 = float(row["e50"])
-                atr  = float(row["atr"])
-                if atr <= 0: continue
-                side = None
-                if rsi < 35 and e20 > e50: side = "LONG"
-                elif rsi > 65 and e20 < e50: side = "SHORT"
-                if side:
-                    sl_dist = atr * 1.5
-                    tp_dist = atr * 2.5
-                    risk_usdt = balance * self.RISK_PCT
-                    units = risk_usdt / sl_dist
-                    size  = units * price
-                    size  = min(size, balance * 0.20)
-                    in_pos = {
-                        "side": side, "entry": price,
-                        "sl": price - sl_dist if side == "LONG" else price + sl_dist,
-                        "tp": price + tp_dist if side == "LONG" else price - tp_dist,
-                        "size": size,
-                    }
+        # Profit Factor
+        pos_v = [p for p in pnl_pcts if p > 0]
+        neg_v = [abs(p) for p in pnl_pcts if p < 0]
+        pf = round(sum(pos_v)/sum(neg_v), 2) if neg_v and sum(neg_v) > 0 else (99.0 if pos_v else 0.0)
 
-        trades = wins + losses
-        win_rate = (wins / trades * 100) if trades else 0
-        pf = (gross_win / gross_loss) if gross_loss > 0 else (gross_win and float("inf") or 0)
         return {
-            "trades": trades, "wins": wins, "losses": losses,
-            "win_rate": round(win_rate, 2),
-            "max_dd_pct": round(max_dd, 2),
-            "profit_factor": round(pf, 2) if math.isfinite(pf) else 999.0,
-            "total_return_pct": round((balance / self.INIT_BAL - 1) * 100, 2),
-            "final_balance": round(balance, 2),
-            "equity_curve": equity_curve,
+            "trades":        trades,
+            "wins":          wins,
+            "losses":        losses,
+            "win_rate":      wr,
+            "max_dd_pct":    max_dd,
+            "profit_factor": pf
         }
 
-    # ── Public runner ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _calc_rsi(s: pd.Series, period: int) -> pd.Series:
+        delta = s.diff()
+        g = delta.clip(lower=0)
+        l = -delta.clip(upper=0)
+        ag = g.ewm(com=period-1, adjust=False).mean()
+        al = l.ewm(com=period-1, adjust=False).mean()
+        rs = ag / al.replace(0, 1e-9)
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def _calc_atr(df: pd.DataFrame, p: int) -> pd.Series:
+        h = df["high"]; l = df["low"]; c = df["close"].shift(1)
+        tr = pd.concat([h-l, (h-c).abs(), (l-c).abs()], axis=1).max(axis=1)
+        return tr.ewm(span=p, adjust=False).mean()
+
+    # ── Runner entrypoint ─────────────────────────────────────────────────────
     async def run(self, symbols: List[str], timeframe: str,
-                  start_date: str, end_date: str) -> Dict:
+                start_date: str, end_date: str) -> Dict:
         start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
         end   = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
         out: Dict[str, Dict] = {}
@@ -204,9 +173,6 @@ class BacktestEngine:
                 f"  Trades        : {r['trades']}  (W:{r['wins']}  L:{r['losses']})",
                 f"  Win-Rate      : {r['win_rate']} %",
                 f"  Max Drawdown  : {r['max_dd_pct']} %",
-                f"  Profit Factor : {r['profit_factor']}",
-                f"  Total Return  : {r['total_return_pct']} %   "
-                f"(Bal: ${r.get('final_balance', 0)})",
-                "",
+                f"  Profit Factor : {r['profit_factor']}", ""
             ]
         return "\n".join(lines)
