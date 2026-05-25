@@ -10,7 +10,7 @@ Usage:
   python main.py --mode analysis
   python main.py --mode weekly_report
   python main.py --mode self_learn
-  python main.py --mode backtest
+  python main.py --mode backtest --symbols BTC/USDT:USDT --timeframe 1h --start 2026-01-01 --end 2026-05-25
 """
 from __future__ import annotations
 import argparse, asyncio, sys, time
@@ -35,7 +35,7 @@ async def _up() -> tuple[SupabaseLogger, TelegramNotifier, DataFetcher]:
 # MODES
 # ══════════════════════════════════════════════════════════════════════
 
-async def _monitor():
+async def _monitor(args=None):
     db, tg, fe = await _up()
     try:
         from scheduler.jobs import job_monitor_positions, init
@@ -46,7 +46,7 @@ async def _monitor():
         await fe.close(); await tg.close()
 
 
-async def _scalp():
+async def _scalp(args=None):
     db, tg, fe = await _up()
     try:
         from scheduler.jobs import job_run_scalp, init
@@ -57,7 +57,7 @@ async def _scalp():
         await fe.close(); await tg.close()
 
 
-async def _swing():
+async def _swing(args=None):
     db, tg, fe = await _up()
     try:
         from scheduler.jobs import job_run_swing, init
@@ -68,7 +68,7 @@ async def _swing():
         await fe.close(); await tg.close()
 
 
-async def _super_swing():
+async def _super_swing(args=None):
     db, tg, fe = await _up()
     try:
         from scheduler.jobs import job_run_super_swing, init
@@ -79,7 +79,7 @@ async def _super_swing():
         await fe.close(); await tg.close()
 
 
-async def _analysis():
+async def _analysis(args=None):
     db, tg, fe = await _up()
     try:
         from engine.analysis_engine import run_full_analysis
@@ -90,7 +90,7 @@ async def _analysis():
         await fe.close(); await tg.close()
 
 
-async def _weekly():
+async def _weekly(args=None):
     db, tg, fe = await _up()
     try:
         from scheduler.jobs import job_weekly_report, init
@@ -101,7 +101,7 @@ async def _weekly():
         await fe.close(); await tg.close()
 
 
-async def _self_learn():
+async def _self_learn(args=None):
     db, tg, fe = await _up()
     try:
         from scheduler.jobs import job_self_learn, init
@@ -112,13 +112,27 @@ async def _self_learn():
         await fe.close(); await tg.close()
 
 
-async def _backtest():
+async def _backtest(args):
     db, tg, fe = await _up()
     try:
         from backtesting.backtest_engine import BacktestEngine
         engine  = BacktestEngine()
-        results = await engine.run()
-        report  = engine.format_report(results)
+        
+        # تحويل نص العملات المفصولة بفاصلة إلى قائمة منظمّة
+        symbols_list = [s.strip() for s in args.symbols.split(",")]
+        
+        logger.info(f"⏳ Starting Backtest for {symbols_list} on {args.timeframe}...")
+        logger.info(f"📅 Period: {args.start} to {args.end}")
+        
+        # تمرير المتغيرات المطلوبة للمحرك بنجاح
+        results = await engine.run(
+            symbols=symbols_list,
+            timeframe=args.timeframe,
+            start_date=args.start,
+            end_date=args.end
+        )
+        
+        report = engine.format_report(results)
         await tg.send(report)
         logger.success("[BACKTEST] Done — report sent to Telegram")
     except Exception as e:
@@ -156,6 +170,13 @@ def main() -> None:
         metavar="MODE",
         help=f"Mode to run:\n{modes_help}",
     )
+    
+    # إضافة المتغيرات الاختيارية للباك تيست مع قيم افتراضية ذكية
+    parser.add_argument("--symbols", default="BTC/USDT:USDT", help="Pairs separated by comma (e.g. BTC/USDT:USDT,ETH/USDT:USDT)")
+    parser.add_argument("--timeframe", default="1h", help="Timeframe (e.g. 5m, 1h, 4h)")
+    parser.add_argument("--start", default="2026-01-01", help="Start date YYYY-MM-DD")
+    parser.add_argument("--end", default="2026-05-25", help="End date YYYY-MM-DD")
+    
     args = parser.parse_args()
     fn, desc = MODES[args.mode]
 
@@ -167,7 +188,8 @@ def main() -> None:
 
     t0 = time.monotonic()
     try:
-        asyncio.run(fn())
+        # تمرير الـ args للدالة المستدعاة
+        asyncio.run(fn(args))
     except KeyboardInterrupt:
         logger.info("🛑 Stopped manually.")
     except Exception as e:
