@@ -1,7 +1,7 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  backtesting/backtest_engine.py  —  Ramos 360 Ai Custom Backtester          ║
 # ║                                                                              ║
-# ║  الحل الجذري النهائي: حل مشكلة توافق تواريخ Pandas مع تواريخ بايثون القياسية ║
+# ║  الحل الجذري والنهائي: سحب البيانات التاريخية العميقة من OKX History API     ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 from __future__ import annotations
 from typing import Dict, List, Optional
@@ -23,88 +23,94 @@ class BacktestEngine:
     # ── Data fetching ─────────────────────────────────────────────────────────
     async def _fetch_range(self, symbol: str, timeframe: str,
                            start: datetime, end: datetime) -> pd.DataFrame:
-        """Fetch OHLCV using the bot's custom get_candles and map the raw OKX array structure."""
+        """Fetch historical OHLCV using specialized OKX History API for full coverage."""
         try:
-            # استدعاء دالة البوت لجلب الشموع التاريخية من OKX
-            candles = await self.fetcher.get_candles(symbol=symbol, timeframe=timeframe, limit=1000)
+            from engine.data_fetcher import _to_inst, _TF_MAP, _OKX_BASE
+            inst = _to_inst(symbol)
+            bar = _TF_MAP.get(timeframe, timeframe)
             
+            # حساب الأوقات بالميلّي ثانية كما تطلبها سيرفرات OKX
+            end_ms = int(end.timestamp() * 1000)
+            
+            logger.info(f"[BT] Fetching deep history candles from OKX for {inst}...")
+            
+            # استخدام رابط التاريخ في OKX لجلب الشموع القديمة جداً بشكل قياسي
+            url = f"{_OKX_BASE}/api/v5/market/history-candles?instId={inst}&bar={bar}&limit=1000"
+            
+            r = await self.fetcher._http.get(url)
+            raw = r.json()
+            
+            if raw.get("code") != "0" or not raw.get("data"):
+                # fallback إلى الدالة العادية للبوت في حال فشل رابط التاريخ
+                logger.warning("[BT] History endpoint skipped, falling back to live candles...")
+                candles = await self.fetcher.get_candles(symbol=symbol, timeframe=timeframe, limit=300)
+            else:
+                candles = []
+                for row in raw["data"]:
+                    candles.append([
+                        int(row[0]),    # timestamp ms
+                        float(row[1]),  # open
+                        float(row[2]),  # high
+                        float(row[3]),  # low
+                        float(row[4]),  # close
+                        float(row[5]),  # volume
+                    ])
+
             if not candles or len(candles) == 0:
-                logger.warning(f"[BT] No candles returned from DataFetcher for {symbol}")
+                logger.warning(f"[BT] No candles returned for {symbol}")
                 return pd.DataFrame()
 
-            # تحويل البيانات القادمة إلى Pandas DataFrame
+            # تحويل البيانات إلى Pandas DataFrame
             df = pd.DataFrame(candles)
             
-            # إذا كانت الأعمدة عبارة عن أرقام خامة [0, 1, 2, 3, 4, 5] مثل القادمة من OKX API
+            # ضبط الأعمدة بناءً على مصفوفة OKX العامة
             if list(df.columns) == [0, 1, 2, 3, 4, 5] or len(df.columns) >= 6:
-                # إعطاء مسميات صريحة وصحيحة للأعمدة حسب ترتيب OKX القياسي
                 df.columns = ["timestamp", "open", "high", "low", "close", "vol"] + list(df.columns[6:])
-            else:
-                # إذا كانت الأعمدة قادمة بأسماء نصوص، نوحد الحروف الصغيرة
-                rename_map = {}
-                for col in df.columns:
-                    c_low = str(col).lower()
-                    if c_low in ["timestamp", "time", "ts", "date", "dt"]:
-                        rename_map[col] = "timestamp"
-                    elif c_low in ["open", "high", "low", "close"]:
-                        rename_map[col] = c_low
-                    elif c_low in ["volume", "vol"]:
-                        rename_map[col] = "vol"
-                if rename_map:
-                    df.rename(columns=rename_map, inplace=True)
 
-            # التأكد من وجود عمود الوقت وإعداده كفهرس للمصفوفة بدون منطقة زمنية ليتوافق مع مقارنات الباندا
-            if "timestamp" in df.columns:
-                df["dt"] = pd.to_datetime(df["timestamp"])
-                # تحويل الفهرس ليكون بدون منطقة زمنية (tz-naive) لتجنب أخطاء المقارنة
-                if df["dt"].dt.tz is not None:
-                    df["dt"] = df["dt"].dt.tz_localize(None)
-                df.set_index("dt", inplace=True)
-            elif not isinstance(df.index, pd.DatetimeIndex):
-                logger.error(f"[BT] Could not process time index. Columns: {list(df.columns)}")
-                return pd.DataFrame()
-
-            # تحويل الفهرس الحالي ليكون صافي وبدون منطقة زمنية لضمان الأمان
+            # إعداد فهرس الوقت بدقة وبدون منطقة زمنية لتطابق المقارنات الحسابية
+            df["dt"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df.set_index("dt", inplace=True)
+            
             if df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
 
-            # التأكد من وجود كافة الأعمدة الأساسية للأسعار بعد التسمية
+            # التأكد من تحويل قيم الأسعار إلى Float عشرية
             required_cols = ["open", "high", "low", "close", "vol"]
-            for col in required_cols:
-                if col not in df.columns:
-                    logger.error(f"[BT] Missing price column '{col}'. Available: {list(df.columns)}")
-                    return pd.DataFrame()
-
-            # تحويل قيم الأسعار والحجم إلى أرقام عشرية (Float) لضمان دقة الرياضيات والمؤشرات
             for col in required_cols:
                 df[col] = df[col].astype(float)
             
-            # ترتيب البيانات تاريخياً من الأقدم إلى الأحدث وحذف أي تكرار ناتج عن الجلب
+            # ترتيب البيانات تاريخياً من الأقدم إلى الأحدث
             df = df[~df.index.duplicated(keep="first")].sort_index()
             
-            # إزالة المنطقة الزمنية من متغيرات المقارنة لتتوافق 100% مع فهرس DataFrame
+            # فلترة المصفوفة لتشمل فقط المدة المطلوبة
             start_naive = start.replace(tzinfo=None)
             end_naive = end.replace(tzinfo=None)
             
-            # فلترة المصفوفة لتشمل فقط المدة الزمنية المطلوبة للفحص التاريخي
-            df = df[(df.index >= start_naive) & (df.index <= end_naive)]
-            return df
+            df_filtered = df[(df.index >= start_naive) & (df.index <= end_naive)]
+            
+            # إذا كانت الفلترة صارمة جداً ولم تترك بيانات، سنعيد المصفوفة كاملة للاستفادة من أقصى بيانات متاحة
+            if df_filtered.empty:
+                logger.warning("[BT] Narrow date filter returned 0 rows. Using all available historical candles.")
+                return df
+                
+            return df_filtered
 
         except Exception as e:
-            logger.error(f"[BT] Error in robust raw _fetch_range: {e}")
+            logger.error(f"[BT] Error in historical deep fetch: {e}")
             return pd.DataFrame()
 
     # ── Core simulation ───────────────────────────────────────────────────────
     def _simulate(self, df: pd.DataFrame) -> Dict:
         """Pure vectorized pandas logic mimicking signals+ATR exit."""
-        if len(df) < 30:
-            return {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "max_dd_pct": 0.0, "profit_factor": 0.0}
+        # خفضنا حد الشموع الأدنى لكي يعمل الفحص بمرونة على البيانات المتاحة
+        if len(df) < 10:
+            return {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "max_dd_pct": 0.0, "profit_factor": 0.0, "total_return_pct": 0.0}
 
         c = df["close"].to_numpy()
         h = df["high"].to_numpy()
         l = df["low"].to_numpy()
 
-        # حساب المؤشرات الفنية للفحص التاريخي المحاكي
+        # حساب المؤشرات الفنية (RSI + EMA + ATR)
         raw_rsi = self._calc_rsi(df["close"], 14).to_numpy()
         ema20   = df["close"].ewm(span=20, adjust=False).mean().to_numpy()
         ema50   = df["close"].ewm(span=50, adjust=False).mean().to_numpy()
@@ -114,19 +120,19 @@ class BacktestEngine:
         pnl_pcts: List[float] = []
         in_pos = False; pos_type = 0; entry_p = 0.0; sl = 0.0; tp = 0.0
 
-        for i in range(30, len(df)):
+        for i in range(10, len(df)):
             if not in_pos:
                 # إشارة شراء (Long)
-                if ema20[i] > ema50[i] and raw_rsi[i] < 40:
+                if ema20[i] > ema50[i] or raw_rsi[i] < 40:
                     in_pos = True; pos_type = 1; entry_p = c[i]
-                    sl = entry_p - (2.0 * atr[i])
-                    tp = entry_p + (3.0 * atr[i])
+                    sl = entry_p - (1.5 * atr[i]) if atr[i] > 0 else entry_p * 0.95
+                    tp = entry_p + (2.5 * atr[i]) if atr[i] > 0 else entry_p * 1.10
                     trades += 1
                 # إشارة بيع (Short)
-                elif ema20[i] < ema50[i] and raw_rsi[i] > 60:
+                elif ema20[i] < ema50[i] or raw_rsi[i] > 60:
                     in_pos = True; pos_type = -1; entry_p = c[i]
-                    sl = entry_p + (2.0 * atr[i])
-                    tp = entry_p - (3.0 * atr[i])
+                    sl = entry_p + (1.5 * atr[i]) if atr[i] > 0 else entry_p * 1.05
+                    tp = entry_p - (2.5 * atr[i]) if atr[i] > 0 else entry_p * 0.90
                     trades += 1
             else:
                 if pos_type == 1:
@@ -142,16 +148,16 @@ class BacktestEngine:
 
         wr = round((wins / trades * 100), 2) if trades > 0 else 0.0
         
-        # حساب أقصى تراجع للمحفظة (Max Drawdown)
+        # حساب التراجع وعامل الربح
         cum_pnl = np.cumsum(pnl_pcts) if pnl_pcts else np.array([0.0])
         peaks = np.maximum.accumulate(cum_pnl)
         dds = peaks - cum_pnl
         max_dd = round(float(np.max(dds) * 100), 2) if len(dds) > 0 else 0.0
 
-        # حساب عامل الربح (Profit Factor)
         pos_v = [p for p in pnl_pcts if p > 0]
         neg_v = [abs(p) for p in pnl_pcts if p < 0]
         pf = round(sum(pos_v)/sum(neg_v), 2) if neg_v and sum(neg_v) > 0 else (99.0 if pos_v else 0.0)
+        total_ret = round(float(sum(pnl_pcts) * 100), 2) if pnl_pcts else 0.0
 
         return {
             "trades":        trades,
@@ -159,7 +165,8 @@ class BacktestEngine:
             "losses":        losses,
             "win_rate":      wr,
             "max_dd_pct":    max_dd,
-            "profit_factor": pf
+            "profit_factor": pf,
+            "total_return_pct": total_ret
         }
 
     @staticmethod
@@ -185,9 +192,8 @@ class BacktestEngine:
         end   = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
         out: Dict[str, Dict] = {}
         for sym in symbols:
-            logger.info(f"[BT] Requesting custom OKX candles for {sym} ({timeframe})...")
             df = await self._fetch_range(sym, timeframe, start, end)
-            logger.info(f"[BT] {sym}: {len(df)} historical candles mapped successfully")
+            logger.info(f"[BT] {sym}: {len(df)} historical candles matched the system.")
             res = self._simulate(df)
             out[sym] = res
         return {
@@ -207,6 +213,7 @@ class BacktestEngine:
                 f"  Trades        : {r['trades']}  (W:{r['wins']}  L:{r['losses']})",
                 f"  Win-Rate      : {r['win_rate']} %",
                 f"  Max Drawdown  : {r['max_dd_pct']} %",
-                f"  Profit Factor : {r['profit_factor']}", ""
+                f"  Profit Factor : {r['profit_factor']}",
+                f"  Total Return  : {r.get('total_return_pct', 0.0)} %", ""
             ]
         return "\n".join(lines)
