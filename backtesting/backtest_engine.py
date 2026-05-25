@@ -63,7 +63,7 @@ class BacktestEngine:
     async def _fetch_range(self, symbol: str, timeframe: str,
                            start: datetime, end: datetime) -> pd.DataFrame:
         """Fetch OHLCV between start..end using CCXT pagination."""
-        ex = self.fetcher._exchange
+        ex = self.fetcher.exchange
         ms_per = ex.parse_timeframe(timeframe) * 1000
         since  = int(start.timestamp() * 1000)
         end_ms = int(end.timestamp() * 1000)
