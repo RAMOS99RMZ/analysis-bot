@@ -178,8 +178,7 @@ async def job_daily_market():
     """
     logger.info("[Daily] 📊 بدء التحليل اليومي الكامل …")
     try:
-
-      from ai.daily_consensus import run_daily_consensus
+        from ai.daily_consensus import run_daily_consensus
         await run_daily_consensus(_notifier)
         # ── 1. تحليل E10 + E11 وإرسال رسالة Telegram ────────────────
         await run_full_analysis(_db, _notifier, _fetcher)
