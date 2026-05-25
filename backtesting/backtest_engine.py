@@ -1,7 +1,7 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  backtesting/backtest_engine.py  —  Ramos 360 Ai Custom Backtester          ║
 # ║                                                                              ║
-# ║  الحل الجذري: متوافق 100% مع نظام httpx و دالة get_candles الخاصة بـ OKX     ║
+# ║  الحل الجذري والنهائي: معالجة ذكية لأعمدة الوقت والأسعار القادمة من OKX       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 from __future__ import annotations
 from typing import Dict, List, Optional
@@ -23,47 +23,68 @@ class BacktestEngine:
     # ── Data fetching ─────────────────────────────────────────────────────────
     async def _fetch_range(self, symbol: str, timeframe: str,
                            start: datetime, end: datetime) -> pd.DataFrame:
-        """Fetch OHLCV using the bot's custom get_candles optimized for OKX."""
+        """Fetch OHLCV using the bot's custom get_candles optimized for OKX with robust column matching."""
         try:
-            # استدعاء الدالة الحقيقية المتواجدة داخل data_fetcher.py الخاص بك
-            # نطلب 1000 شمعة كحد أقصى للفحص التاريخي
+            # استدعاء دالة البوت لجلب الشموع التاريخية
             candles = await self.fetcher.get_candles(symbol=symbol, timeframe=timeframe, limit=1000)
             
             if not candles or len(candles) == 0:
                 logger.warning(f"[BT] No candles returned from DataFetcher for {symbol}")
                 return pd.DataFrame()
 
-            # تحويل قائمة القواميس القادمة من البوت إلى Pandas DataFrame
+            # تحويل البيانات القادمة إلى Pandas DataFrame
             df = pd.DataFrame(candles)
             
-            # التأكد من وجود الأعمدة المطلوبة وتوحيد مسمياتها للحسابات الرياضية
-            # البوت يعيد الأعمدة بأسماء: 'timestamp', 'open', 'high', 'low', 'close', 'volume'
-            required_cols = ["timestamp", "open", "high", "low", "close", "volume"]
+            # 1. حل مشكلة عمود الوقت بذكاء (البحث بكافة الصيغ الممكنة للـ Timestamp)
+            time_col = None
+            for col in df.columns:
+                if str(col).lower() in ["timestamp", "time", "ts", "date", "dt"]:
+                    time_col = col
+                    break
+            
+            if time_col:
+                # إذا وجدنا عمود الوقت نقوم بتحويله إلى صيغة تاريخية وجعله الفهرس
+                df["dt"] = pd.to_datetime(df[time_col])
+                df.set_index("dt", inplace=True)
+            elif isinstance(df.index, pd.DatetimeIndex):
+                # إذا كانت البيانات قادمة والوقت مجهز مسبقاً كفهرس (Index)
+                pass
+            else:
+                logger.error(f"[BT] Could not find any time/timestamp column. Columns available: {list(df.columns)}")
+                return pd.DataFrame()
+
+            # 2. توحيد مسميات أعمدة الأسعار لتكون بحروف صغيرة ومتوافقة تماماً مع عمليات المحرك الحسابية
+            rename_map = {}
+            for col in df.columns:
+                c_low = str(col).lower()
+                if c_low in ["open", "high", "low", "close"]:
+                    rename_map[col] = c_low
+                elif c_low in ["volume", "vol"]:
+                    rename_map[col] = "vol"
+            
+            if rename_map:
+                df.rename(columns=rename_map, inplace=True)
+
+            # التأكد من وجود كافة الأعمدة الأساسية المطلوبة بعد التوحيد
+            required_cols = ["open", "high", "low", "close", "vol"]
             for col in required_cols:
                 if col not in df.columns:
-                    logger.error(f"[BT] Missing required column '{col}' in fetched data.")
+                    logger.error(f"[BT] Missing required price column '{col}' after normalization. Available: {list(df.columns)}")
                     return pd.DataFrame()
 
-            # تحويل العمود الزمني إلى صيغة Datetime وجعله الفهرس (Index)
-            df["dt"] = pd.to_datetime(df["timestamp"])
-            df.set_index("dt", inplace=True)
-            
-            # تحويل الأسعار إلى أرقام عشرية (Float) لضمان دقة العمليات الحسابية
-            for col in ["open", "high", "low", "close", "volume"]:
+            # تحويل كافة قيم الأسعار والحجم إلى أرقام عشرية (Float) لضمان دقة العمليات الرياضية
+            for col in required_cols:
                 df[col] = df[col].astype(float)
-
-            # إعادة تسمية عمود الحجم ليتوافق مع بقية كود المحرك
-            df.rename(columns={"volume": "vol"}, inplace=True)
             
-            # ترتيب البيانات من الأقدم إلى الأحدث وحذف التكرار
+            # ترتيب البيانات تاريخياً من الأقدم إلى الأحدث وحذف أي تكرار ناتج عن الجلب
             df = df[~df.index.duplicated(keep="first")].sort_index()
             
-            # فلترة البيانات لتكون بدقة بين تاريخ البداية والنهاية المطلوبين في الفحص
+            # فلترة المصفوفة لتشمل فقط المدة الزمنية المطلوبة للفحص التاريخي
             df = df[(df.index >= start) & (df.index <= end)]
             return df
 
         except Exception as e:
-            logger.error(f"[BT] Error in custom _fetch_range: {e}")
+            logger.error(f"[BT] Error in robust _fetch_range: {e}")
             return pd.DataFrame()
 
     # ── Core simulation ───────────────────────────────────────────────────────
@@ -76,7 +97,7 @@ class BacktestEngine:
         h = df["high"].to_numpy()
         l = df["low"].to_numpy()
 
-        # حساب المؤشرات الفنية الأساسية للمحرك المحاكي
+        # حساب المؤشرات الفنية للفحص التاريخي المحاكي
         raw_rsi = self._calc_rsi(df["close"], 14).to_numpy()
         ema20   = df["close"].ewm(span=20, adjust=False).mean().to_numpy()
         ema50   = df["close"].ewm(span=50, adjust=False).mean().to_numpy()
@@ -114,7 +135,7 @@ class BacktestEngine:
 
         wr = round((wins / trades * 100), 2) if trades > 0 else 0.0
         
-        # حساب أقصى تراجع للحساب (Max Drawdown)
+        # حساب أقصى تراجع للمحفظة (Max Drawdown)
         cum_pnl = np.cumsum(pnl_pcts) if pnl_pcts else np.array([0.0])
         peaks = np.maximum.accumulate(cum_pnl)
         dds = peaks - cum_pnl
