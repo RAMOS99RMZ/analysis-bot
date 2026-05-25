@@ -1,17 +1,7 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  backtesting/backtest_engine.py  —  Pure-Pandas Backtester  (v2)            ║
+# ║  backtesting/backtest_engine.py  —  Ramos 360 Ai Custom Backtester          ║
 # ║                                                                              ║
-# ║  لا يعتمد على vectorbt — يعمل في GitHub Actions بدون أي مشاكل تثبيت.        ║
-# ║  يحاكي محرك الإشارة المبسّط (RSI + EMA Cross + ATR SL/TP)  ويُرجع:          ║
-# ║     - Win Rate                                                              ║
-# ║     - Max Drawdown                                                          ║
-# ║     - عدد الصفقات الكلي / الرابحة / الخاسرة                                ║
-# ║     - متوسط الربح والخسارة + عامل الربح (Profit Factor)                    ║
-# ║                                                                              ║
-# ║  Run:                                                                       ║
-# ║   python main.py --mode backtest \                                          ║
-# ║       --symbols "BTC/USDT:USDT,ETH/USDT:USDT" \                             ║
-# ║       --timeframe 1h --start 2026-01-01 --end 2026-05-10                    ║
+# ║  الحل الجذري: متوافق 100% مع نظام httpx و دالة get_candles الخاصة بـ OKX     ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 from __future__ import annotations
 from typing import Dict, List, Optional
@@ -27,49 +17,66 @@ from config import CONFIG
 
 class BacktestEngine:
     def __init__(self):
+        # استخدام الـ DataFetcher الذكي الخاص بالبوت
         self.fetcher = DataFetcher()
 
     # ── Data fetching ─────────────────────────────────────────────────────────
     async def _fetch_range(self, symbol: str, timeframe: str,
                            start: datetime, end: datetime) -> pd.DataFrame:
-        """Fetch OHLCV between start..end using CCXT pagination."""
-        # تم إصلاح هذا السطر ليتوافق مع كائن الـ exchange الخاص بالبوت الخاص بك
-        ex = self.fetcher.exchange
-        ms_per = ex.parse_timeframe(timeframe) * 1000
-        since  = int(start.timestamp() * 1000)
-        end_ms = int(end.timestamp() * 1000)
-        rows   = []
+        """Fetch OHLCV using the bot's custom get_candles optimized for OKX."""
+        try:
+            # استدعاء الدالة الحقيقية المتواجدة داخل data_fetcher.py الخاص بك
+            # نطلب 1000 شمعة كحد أقصى للفحص التاريخي
+            candles = await self.fetcher.get_candles(symbol=symbol, timeframe=timeframe, limit=1000)
+            
+            if not candles or len(candles) == 0:
+                logger.warning(f"[BT] No candles returned from DataFetcher for {symbol}")
+                return pd.DataFrame()
 
-        while since < end_ms:
-            try:
-                batch = await ex.fetch_ohlcv(symbol, timeframe, since=since, limit=300)
-            except Exception as e:
-                logger.warning(f"[BT] fetch_ohlcv error {symbol}: {e}"); break
-            if not batch: break
-            rows.extend(batch)
-            last_ts = batch[-1][0]
-            if last_ts <= since: break
-            since = last_ts + ms_per
+            # تحويل قائمة القواميس القادمة من البوت إلى Pandas DataFrame
+            df = pd.DataFrame(candles)
+            
+            # التأكد من وجود الأعمدة المطلوبة وتوحيد مسمياتها للحسابات الرياضية
+            # البوت يعيد الأعمدة بأسماء: 'timestamp', 'open', 'high', 'low', 'close', 'volume'
+            required_cols = ["timestamp", "open", "high", "low", "close", "volume"]
+            for col in required_cols:
+                if col not in df.columns:
+                    logger.error(f"[BT] Missing required column '{col}' in fetched data.")
+                    return pd.DataFrame()
 
-        if not rows: return pd.DataFrame()
-        df = pd.DataFrame(rows, columns=["ts","open","high","low","close","vol"])
-        df = df[df["ts"] <= end_ms]
-        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        df.set_index("dt", inplace=True)
-        df = df[~df.index.duplicated(keep="first")].sort_index()
-        return df
+            # تحويل العمود الزمني إلى صيغة Datetime وجعله الفهرس (Index)
+            df["dt"] = pd.to_datetime(df["timestamp"])
+            df.set_index("dt", inplace=True)
+            
+            # تحويل الأسعار إلى أرقام عشرية (Float) لضمان دقة العمليات الحسابية
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = df[col].astype(float)
+
+            # إعادة تسمية عمود الحجم ليتوافق مع بقية كود المحرك
+            df.rename(columns={"volume": "vol"}, inplace=True)
+            
+            # ترتيب البيانات من الأقدم إلى الأحدث وحذف التكرار
+            df = df[~df.index.duplicated(keep="first")].sort_index()
+            
+            # فلترة البيانات لتكون بدقة بين تاريخ البداية والنهاية المطلوبين في الفحص
+            df = df[(df.index >= start) & (df.index <= end)]
+            return df
+
+        except Exception as e:
+            logger.error(f"[BT] Error in custom _fetch_range: {e}")
+            return pd.DataFrame()
 
     # ── Core simulation ───────────────────────────────────────────────────────
     def _simulate(self, df: pd.DataFrame) -> Dict:
         """Pure vectorized pandas logic mimicking signals+ATR exit."""
-        if len(df) < 50:
+        if len(df) < 30:
             return {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "max_dd_pct": 0.0, "profit_factor": 0.0}
 
         c = df["close"].to_numpy()
         h = df["high"].to_numpy()
         l = df["low"].to_numpy()
 
-        # Simple Indicators for simulation
+        # حساب المؤشرات الفنية الأساسية للمحرك المحاكي
         raw_rsi = self._calc_rsi(df["close"], 14).to_numpy()
         ema20   = df["close"].ewm(span=20, adjust=False).mean().to_numpy()
         ema50   = df["close"].ewm(span=50, adjust=False).mean().to_numpy()
@@ -79,15 +86,15 @@ class BacktestEngine:
         pnl_pcts: List[float] = []
         in_pos = False; pos_type = 0; entry_p = 0.0; sl = 0.0; tp = 0.0
 
-        for i in range(50, len(df)):
+        for i in range(30, len(df)):
             if not in_pos:
-                # Long trigger
+                # إشارة شراء (Long)
                 if ema20[i] > ema50[i] and raw_rsi[i] < 40:
                     in_pos = True; pos_type = 1; entry_p = c[i]
                     sl = entry_p - (2.0 * atr[i])
                     tp = entry_p + (3.0 * atr[i])
                     trades += 1
-                # Short trigger
+                # إشارة بيع (Short)
                 elif ema20[i] < ema50[i] and raw_rsi[i] > 60:
                     in_pos = True; pos_type = -1; entry_p = c[i]
                     sl = entry_p + (2.0 * atr[i])
@@ -107,13 +114,13 @@ class BacktestEngine:
 
         wr = round((wins / trades * 100), 2) if trades > 0 else 0.0
         
-        # Drawdown calculation
+        # حساب أقصى تراجع للحساب (Max Drawdown)
         cum_pnl = np.cumsum(pnl_pcts) if pnl_pcts else np.array([0.0])
         peaks = np.maximum.accumulate(cum_pnl)
         dds = peaks - cum_pnl
         max_dd = round(float(np.max(dds) * 100), 2) if len(dds) > 0 else 0.0
 
-        # Profit Factor
+        # حساب عامل الربح (Profit Factor)
         pos_v = [p for p in pnl_pcts if p > 0]
         neg_v = [abs(p) for p in pnl_pcts if p < 0]
         pf = round(sum(pos_v)/sum(neg_v), 2) if neg_v and sum(neg_v) > 0 else (99.0 if pos_v else 0.0)
@@ -150,11 +157,10 @@ class BacktestEngine:
         end   = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
         out: Dict[str, Dict] = {}
         for sym in symbols:
-            logger.info(f"[BT] Fetching {sym} {timeframe} {start_date}..{end_date}")
+            logger.info(f"[BT] Requesting custom candles for {sym} ({timeframe})...")
             df = await self._fetch_range(sym, timeframe, start, end)
-            logger.info(f"[BT] {sym}: {len(df)} candles")
+            logger.info(f"[BT] {sym}: {len(df)} historical candles matched the timeframe")
             res = self._simulate(df)
-            res.pop("equity_curve", None)  # keep report compact
             out[sym] = res
         return {
             "period":    f"{start_date} → {end_date}",
