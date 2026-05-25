@@ -1,7 +1,7 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  backtesting/backtest_engine.py  —  Ramos 360 Ai Custom Backtester          ║
 # ║                                                                              ║
-# ║  الحل الجذري النهائي: دعم كامل للمصفوفات الرقمية الخام القادمة من OKX       ║
+# ║  الحل الجذري النهائي: حل مشكلة توافق تواريخ Pandas مع تواريخ بايثون القياسية ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 from __future__ import annotations
 from typing import Dict, List, Optional
@@ -53,13 +53,20 @@ class BacktestEngine:
                 if rename_map:
                     df.rename(columns=rename_map, inplace=True)
 
-            # التأكد من وجود عمود الوقت وإعداده كفهرس للمصفوفة
+            # التأكد من وجود عمود الوقت وإعداده كفهرس للمصفوفة بدون منطقة زمنية ليتوافق مع مقارنات الباندا
             if "timestamp" in df.columns:
                 df["dt"] = pd.to_datetime(df["timestamp"])
+                # تحويل الفهرس ليكون بدون منطقة زمنية (tz-naive) لتجنب أخطاء المقارنة
+                if df["dt"].dt.tz is not None:
+                    df["dt"] = df["dt"].dt.tz_localize(None)
                 df.set_index("dt", inplace=True)
             elif not isinstance(df.index, pd.DatetimeIndex):
                 logger.error(f"[BT] Could not process time index. Columns: {list(df.columns)}")
                 return pd.DataFrame()
+
+            # تحويل الفهرس الحالي ليكون صافي وبدون منطقة زمنية لضمان الأمان
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
 
             # التأكد من وجود كافة الأعمدة الأساسية للأسعار بعد التسمية
             required_cols = ["open", "high", "low", "close", "vol"]
@@ -75,8 +82,12 @@ class BacktestEngine:
             # ترتيب البيانات تاريخياً من الأقدم إلى الأحدث وحذف أي تكرار ناتج عن الجلب
             df = df[~df.index.duplicated(keep="first")].sort_index()
             
+            # إزالة المنطقة الزمنية من متغيرات المقارنة لتتوافق 100% مع فهرس DataFrame
+            start_naive = start.replace(tzinfo=None)
+            end_naive = end.replace(tzinfo=None)
+            
             # فلترة المصفوفة لتشمل فقط المدة الزمنية المطلوبة للفحص التاريخي
-            df = df[(df.index >= start) & (df.index <= end)]
+            df = df[(df.index >= start_naive) & (df.index <= end_naive)]
             return df
 
         except Exception as e:
