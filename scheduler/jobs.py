@@ -1,18 +1,14 @@
-
-# scheduler/jobs.py
-# All timed jobs: scalp (15m), swing (2h), super-swing (4h),
-# monitor (5m), daily (00:00 UTC), weekly, heartbeat
-
+# scheduler/jobs.py — Updated with Gemini Vision + all fixes
 from __future__ import annotations
 import asyncio
 from loguru import logger
 
 from config import CONFIG
 from engine.data_fetcher import DataFetcher
-from engine.signal_generator import run_all_assets
+from engine.signal_generator import run_all_assets, record_trade_result
 from engine.risk_manager import calc_sltp, get_trade_type
 from engine.indicator_engine import IndicatorEngine
-from engine.analysis_engine import run_full_analysis   # ← جديد
+from engine.analysis_engine import run_full_analysis
 from ai.confirmation import confirm_signal
 from database import SupabaseLogger
 from notifier import TelegramNotifier
@@ -21,7 +17,6 @@ from utils.helpers import (is_circuit_open, make_run_id,
 
 IE = IndicatorEngine()
 
-# ── Shared singletons ─────────────────────────────────────────────
 _db:       SupabaseLogger   = None
 _notifier: TelegramNotifier = None
 _fetcher:  DataFetcher      = None
@@ -32,7 +27,7 @@ def init(db: SupabaseLogger, notifier: TelegramNotifier, fetcher: DataFetcher):
 
 
 # ══════════════════════════════════════════════════════════════════
-# JOB 1 — MONITOR POSITIONS (every 5 min)
+# JOB 1 — MONITOR POSITIONS
 # ══════════════════════════════════════════════════════════════════
 async def job_monitor_positions():
     if is_circuit_open(): return
@@ -72,20 +67,36 @@ async def job_monitor_positions():
             if event:
                 await _notifier.send_monitor_alert(symbol, direction, event, price, pnl_pct)
                 status = "CLOSED" if event in ("SL", "TP3") else event
-                await _db.log_trade({
-                    "symbol": symbol, "direction": direction,
-                    "trade_type": trade.get("trade_type", "?"),
-                    "status": status, "entry_price": entry,
-                    "exit_price": price, "pnl_pct": round(pnl_pct, 4),
-                    "size_usdt": trade.get("size_usdt", 0),
-                    "run_id": trade.get("run_id", ""),
-                })
 
-            daily_pnl = _db.get_daily_pnl()
-            if daily_pnl < -CONFIG.MAX_DAILY_LOSS_PCT * 100:
-                await _notifier.send_circuit_breaker(f"Daily PnL {daily_pnl:.2f}%")
-                logger.warning(f"[Monitor] 🚨 Daily loss limit: {daily_pnl:.2f}%")
-                return
+                # ✅ Adaptive Learning — تسجيل نتيجة الصفقة عند الإغلاق
+                if status == "CLOSED":
+                    try:
+                        record_trade_result(symbol, 0.0, pnl_pct)
+                        logger.debug(f"[Adaptive] {symbol} pnl={pnl_pct:.2f}% recorded")
+                    except Exception as e:
+                        logger.debug(f"[Adaptive] {e}")
+
+                try:
+                    await _db.log_trade({
+                        "symbol": symbol, "direction": direction,
+                        "trade_type": trade.get("trade_type", "?"),
+                        "status": status, "entry_price": entry,
+                        "exit_price": price, "pnl_pct": round(pnl_pct, 4),
+                        "size_usdt": trade.get("size_usdt", 0),
+                        "run_id": trade.get("run_id", ""),
+                    })
+                except Exception as e:
+                    logger.warning(f"[Monitor] DB log_trade: {e}")
+
+            try:
+                daily_pnl = _db.get_daily_pnl()
+                if daily_pnl < -CONFIG.MAX_DAILY_LOSS * 100:
+                    await _notifier.send_circuit_breaker(f"Daily PnL {daily_pnl:.2f}%")
+                    logger.warning(f"[Monitor] 🚨 Daily loss limit: {daily_pnl:.2f}%")
+                    return
+            except Exception:
+                pass
+
     except Exception as e:
         logger.error(f"[Monitor] Error: {e}")
 
@@ -95,7 +106,10 @@ async def job_monitor_positions():
 # ══════════════════════════════════════════════════════════════════
 async def _run_signal_pipeline(run_tag: str):
     if is_circuit_open():
-        await _notifier.send_circuit_breaker("API circuit breaker open")
+        try:
+            await _notifier.send_circuit_breaker("API circuit breaker open")
+        except Exception:
+            pass
         return
 
     run_id  = make_run_id(run_tag)
@@ -104,13 +118,20 @@ async def _run_signal_pipeline(run_tag: str):
 
     assets_data = await _fetcher.fetch_all_assets()
     balance     = await _fetcher.get_balance()
-    fear_greed  = await _fetcher.get_fear_greed()
+
+    try:
+        fear_greed = await _fetcher.get_fear_greed()
+    except Exception:
+        fear_greed = {}
 
     for sym, d in assets_data.items():
         if d:
-            d["fear_greed"]      = fear_greed
-            d["funding"]         = await _fetcher.get_funding_rate(sym)
-            d["usdt_dominance"]  = {}
+            d["fear_greed"]     = fear_greed
+            d["usdt_dominance"] = {}
+            try:
+                d["funding"] = await _fetcher.get_funding_rate(sym)
+            except Exception:
+                d["funding"] = {}
 
     if balance <= 0:
         logger.warning(f"[{run_tag}] Balance=0, skipping")
@@ -126,73 +147,92 @@ async def _run_signal_pipeline(run_tag: str):
 
     sent = 0
     for sig in signals:
-        ai_ans = await confirm_signal(sig)
+
+        # ── AI Confirmation (Groq + Gemini) ──────────────────────────
+        try:
+            ai_ans = await confirm_signal(sig)
+        except Exception:
+            ai_ans = "SKIP"
         sig["ai_confirmation"] = ai_ans
         if ai_ans == "NO":
             logger.info(f"[AI] Rejected: {sig['symbol']} {sig['direction']}")
             continue
-        await _db.log_signal(sig)
-        await _db.log_trade({
-            "symbol": sig["symbol"], "direction": sig["direction"],
-            "trade_type": sig["trade_type"], "status": "OPEN",
-            "entry_price": sig["entry"], "exit_price": None,
-            "pnl_pct": 0, "size_usdt": sig["size_usdt"], "run_id": run_id,
-        })
-        await _notifier.send_signal(sig)
-        sent += 1
+
+        # ── ✅ Gemini Vision — تأكيد بصري (مرة كل 4 ساعات لكل عملة) ──
+        try:
+            from ai.gemini_vision import analyze_pattern, parse_vision_decision
+            c4h_data   = assets_data.get(sig["symbol"], {}).get("c4h", [])
+            vision_dec = "NEUTRAL"
+            if c4h_data:
+                vision_text = await analyze_pattern(sig["symbol"], c4h_data, sig)
+                vision_dec  = parse_vision_decision(vision_text)
+                sig["gemini_vision"] = vision_dec
+                logger.info(f"[Vision] {sig['symbol']} → {vision_dec}")
+                if vision_dec == "REJECT":
+                    logger.info(f"[Vision] {sig['symbol']} رُفض بصرياً بواسطة Gemini")
+                    continue
+        except Exception as e:
+            logger.debug(f"[Vision] {sig['symbol']}: {e}")
+            sig["gemini_vision"] = "NEUTRAL"
+
+        # ── ✅ إرسال Telegram أولاً (حتى لو فشل DB) ─────────────────
+        try:
+            await _notifier.send_signal(sig)
+            sent += 1
+            logger.info(f"[{run_tag}] ✅ Telegram: {sig['symbol']} {sig['direction']}")
+        except Exception as e:
+            logger.error(f"[{run_tag}] Telegram FAILED: {e}")
+
+        # ── حفظ في DB ────────────────────────────────────────────────
+        try:
+            await _db.log_signal(sig)
+        except Exception as e:
+            logger.warning(f"[Jobs] log_signal: {e}")
+        try:
+            await _db.log_trade({
+                "symbol":      sig["symbol"],
+                "direction":   sig["direction"],
+                "trade_type":  sig["trade_type"],
+                "status":      "OPEN",
+                "entry_price": sig["entry"],
+                "exit_price":  None,
+                "pnl_pct":     0,
+                "size_usdt":   sig["size_usdt"],
+                "run_id":      run_id,
+            })
+        except Exception as e:
+            logger.warning(f"[Jobs] log_trade: {e}")
+
         await asyncio.sleep(0.3)
 
-    logger.info(f"[{run_tag}] ✅ Done — {sent} signals sent")
+    logger.info(f"[{run_tag}] ✅ Done — {sent}/{len(signals)} signals sent")
 
 
 # ══════════════════════════════════════════════════════════════════
-# JOB 2 — SCALP (every 15 min)
-# ══════════════════════════════════════════════════════════════════
-async def job_run_scalp():
-    await _run_signal_pipeline("SCALP")
+async def job_run_scalp():       await _run_signal_pipeline("SCALP")
+async def job_run_swing():       await _run_signal_pipeline("SWING")
+async def job_run_super_swing(): await _run_signal_pipeline("SUPER_SWING")
 
 
 # ══════════════════════════════════════════════════════════════════
-# JOB 3 — SWING (every 2 hours)
-# ══════════════════════════════════════════════════════════════════
-async def job_run_swing():
-    await _run_signal_pipeline("SWING")
-
-
-# ══════════════════════════════════════════════════════════════════
-# JOB 4 — SUPER SWING (every 4 hours)
-# ══════════════════════════════════════════════════════════════════
-async def job_run_super_swing():
-    await _run_signal_pipeline("SUPER_SWING")
-
-
-# ══════════════════════════════════════════════════════════════════
-# JOB 5 — DAILY MARKET ANALYSIS (00:00 UTC)
+# JOB 5 — DAILY MARKET ANALYSIS
 # ══════════════════════════════════════════════════════════════════
 async def job_daily_market():
-    """
-    التحليل اليومي الكامل:
-      - يُشغّل E10 (BTC/ETH شارت) + E11 (USDT.D شارت)
-      - يرسل رسالة Telegram شاملة عبر analysis_engine
-      - يُسجّل الأداء اليومي في Supabase
-    """
     logger.info("[Daily] 📊 بدء التحليل اليومي الكامل …")
     try:
         from ai.daily_consensus import run_daily_consensus
         await run_daily_consensus(_notifier)
-        # ── 1. تحليل E10 + E11 وإرسال رسالة Telegram ────────────────
+
         await run_full_analysis(_db, _notifier, _fetcher)
 
-        # ── 2. تسجيل الأداء اليومي في Supabase ──────────────────────
-        daily_pnl  = _db.get_daily_pnl()
-        open_t     = _db.get_open_trades()
+        daily_pnl = _db.get_daily_pnl()
+        open_t    = _db.get_open_trades()
         stats = {
-            "wins":      0,
-            "losses":    0,
-            "total":     len(open_t),
-            "win_rate":  0,
+            "wins": 0, "losses": 0,
+            "total": len(open_t),
+            "win_rate": 0,
             "total_pnl": daily_pnl,
-            "max_dd":    0,
+            "max_dd": 0,
         }
         await _db.log_performance(stats)
         await _db.heartbeat(CONFIG.VERSION, CONFIG.ASSETS)
@@ -200,7 +240,6 @@ async def job_daily_market():
 
     except Exception as e:
         logger.error(f"[Daily] Error: {e}")
-        # إرسال تحذير للـ Telegram إذا فشل التحليل
         try:
             await _notifier.send(f"⚠️ <b>خطأ في التحليل اليومي</b>\n<code>{e}</code>")
         except Exception:
@@ -208,7 +247,7 @@ async def job_daily_market():
 
 
 # ══════════════════════════════════════════════════════════════════
-# JOB 6 — WEEKLY REPORT (Monday 08:00 UTC)
+# JOB 6 — WEEKLY REPORT
 # ══════════════════════════════════════════════════════════════════
 async def job_weekly_report():
     logger.info("[Weekly] 📋 Sending weekly report …")
@@ -225,7 +264,7 @@ async def job_weekly_report():
 
 
 # ══════════════════════════════════════════════════════════════════
-# JOB 7 — HEARTBEAT (every 6 hours)
+# JOB 7 — HEARTBEAT
 # ══════════════════════════════════════════════════════════════════
 async def job_heartbeat():
     await _db.heartbeat(CONFIG.VERSION, CONFIG.ASSETS)
