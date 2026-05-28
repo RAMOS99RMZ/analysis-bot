@@ -1,4 +1,3 @@
-
 # ai/gemini_vision.py — Pattern Recognition بـ Gemini Vision
 # ══════════════════════════════════════════════════════════════════
 # يرسم الشارت كـ ASCII/JSON ثم يطلب من Gemini تحليله بصرياً
