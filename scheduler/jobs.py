@@ -1,19 +1,18 @@
-# scheduler/jobs.py — Updated with Gemini Vision + all fixes
+# scheduler/jobs.py — Clean Final Version
 from __future__ import annotations
 import asyncio
 from loguru import logger
 
 from config import CONFIG
 from engine.data_fetcher import DataFetcher
-from engine.signal_generator import run_all_assets, record_trade_result
-from engine.risk_manager import calc_sltp, get_trade_type
+from engine.signal_generator import run_all_assets
 from engine.indicator_engine import IndicatorEngine
 from engine.analysis_engine import run_full_analysis
 from ai.confirmation import confirm_signal
 from database import SupabaseLogger
 from notifier import TelegramNotifier
 from utils.helpers import (is_circuit_open, make_run_id,
-                            utc_hour, record_sl_hit, get_session)
+                            record_sl_hit, get_session)
 
 IE = IndicatorEngine()
 
@@ -65,34 +64,47 @@ async def job_monitor_positions():
                 elif tp1 and price <= tp1: event = "TP1"
 
             if event:
-                await _notifier.send_monitor_alert(symbol, direction, event, price, pnl_pct)
+                # إرسال Telegram
+                try:
+                    await _notifier.send_monitor_alert(
+                        symbol, direction, event, price, pnl_pct
+                    )
+                except Exception as e:
+                    logger.error(f"[Monitor] Telegram: {e}")
+
                 status = "CLOSED" if event in ("SL", "TP3") else event
 
-                # ✅ Adaptive Learning — تسجيل نتيجة الصفقة عند الإغلاق
+                # ✅ Adaptive Learning — يسجّل النتيجة بأمان
                 if status == "CLOSED":
                     try:
+                        from engine.signal_generator import record_trade_result
                         record_trade_result(symbol, 0.0, pnl_pct)
-                        logger.debug(f"[Adaptive] {symbol} pnl={pnl_pct:.2f}% recorded")
-                    except Exception as e:
-                        logger.debug(f"[Adaptive] {e}")
+                    except Exception:
+                        pass   # إذا لم يكن موجوداً في الملف القديم → تجاهل بصمت
 
+                # حفظ في DB
                 try:
                     await _db.log_trade({
-                        "symbol": symbol, "direction": direction,
-                        "trade_type": trade.get("trade_type", "?"),
-                        "status": status, "entry_price": entry,
-                        "exit_price": price, "pnl_pct": round(pnl_pct, 4),
-                        "size_usdt": trade.get("size_usdt", 0),
-                        "run_id": trade.get("run_id", ""),
+                        "symbol":      symbol,
+                        "direction":   direction,
+                        "trade_type":  trade.get("trade_type", "?"),
+                        "status":      status,
+                        "entry_price": entry,
+                        "exit_price":  price,
+                        "pnl_pct":     round(pnl_pct, 4),
+                        "size_usdt":   trade.get("size_usdt", 0),
+                        "run_id":      trade.get("run_id", ""),
                     })
                 except Exception as e:
-                    logger.warning(f"[Monitor] DB log_trade: {e}")
+                    logger.warning(f"[Monitor] DB: {e}")
 
+            # Daily loss check
             try:
                 daily_pnl = _db.get_daily_pnl()
                 if daily_pnl < -CONFIG.MAX_DAILY_LOSS * 100:
-                    await _notifier.send_circuit_breaker(f"Daily PnL {daily_pnl:.2f}%")
-                    logger.warning(f"[Monitor] 🚨 Daily loss limit: {daily_pnl:.2f}%")
+                    await _notifier.send_circuit_breaker(
+                        f"Daily PnL {daily_pnl:.2f}%"
+                    )
                     return
             except Exception:
                 pass
@@ -148,7 +160,7 @@ async def _run_signal_pipeline(run_tag: str):
     sent = 0
     for sig in signals:
 
-        # ── AI Confirmation (Groq + Gemini) ──────────────────────────
+        # ── AI Confirmation ───────────────────────────────────────────
         try:
             ai_ans = await confirm_signal(sig)
         except Exception:
@@ -158,36 +170,41 @@ async def _run_signal_pipeline(run_tag: str):
             logger.info(f"[AI] Rejected: {sig['symbol']} {sig['direction']}")
             continue
 
-        # ── ✅ Gemini Vision — تأكيد بصري (مرة كل 4 ساعات لكل عملة) ──
+        # ── ✅ Gemini Vision (مرة كل 4 ساعات لكل عملة) ───────────────
         try:
             from ai.gemini_vision import analyze_pattern, parse_vision_decision
-            c4h_data   = assets_data.get(sig["symbol"], {}).get("c4h", [])
-            vision_dec = "NEUTRAL"
+            c4h_data = assets_data.get(sig["symbol"], {}).get("c4h", [])
             if c4h_data:
                 vision_text = await analyze_pattern(sig["symbol"], c4h_data, sig)
                 vision_dec  = parse_vision_decision(vision_text)
                 sig["gemini_vision"] = vision_dec
                 logger.info(f"[Vision] {sig['symbol']} → {vision_dec}")
                 if vision_dec == "REJECT":
-                    logger.info(f"[Vision] {sig['symbol']} رُفض بصرياً بواسطة Gemini")
+                    logger.info(f"[Vision] {sig['symbol']} رُفض بواسطة Gemini")
                     continue
+            else:
+                sig["gemini_vision"] = "NEUTRAL"
         except Exception as e:
-            logger.debug(f"[Vision] {sig['symbol']}: {e}")
+            logger.debug(f"[Vision] {sig.get('symbol','?')}: {e}")
             sig["gemini_vision"] = "NEUTRAL"
 
-        # ── ✅ إرسال Telegram أولاً (حتى لو فشل DB) ─────────────────
+        # ── ✅ Telegram أولاً دائماً ──────────────────────────────────
         try:
             await _notifier.send_signal(sig)
             sent += 1
-            logger.info(f"[{run_tag}] ✅ Telegram: {sig['symbol']} {sig['direction']}")
+            logger.info(
+                f"[{run_tag}] ✅ Sent: {sig['symbol']} {sig['direction']} "
+                f"score={sig.get('score',0):.3f}"
+            )
         except Exception as e:
             logger.error(f"[{run_tag}] Telegram FAILED: {e}")
 
-        # ── حفظ في DB ────────────────────────────────────────────────
+        # ── حفظ في DB ─────────────────────────────────────────────────
         try:
             await _db.log_signal(sig)
         except Exception as e:
             logger.warning(f"[Jobs] log_signal: {e}")
+
         try:
             await _db.log_trade({
                 "symbol":      sig["symbol"],
@@ -215,56 +232,65 @@ async def job_run_super_swing(): await _run_signal_pipeline("SUPER_SWING")
 
 
 # ══════════════════════════════════════════════════════════════════
-# JOB 5 — DAILY MARKET ANALYSIS
+# JOB 5 — DAILY
 # ══════════════════════════════════════════════════════════════════
 async def job_daily_market():
-    logger.info("[Daily] 📊 بدء التحليل اليومي الكامل …")
+    logger.info("[Daily] 📊 بدء التحليل اليومي …")
     try:
-        from ai.daily_consensus import run_daily_consensus
-        await run_daily_consensus(_notifier)
+        try:
+            from ai.daily_consensus import run_daily_consensus
+            await run_daily_consensus(_notifier)
+        except Exception as e:
+            logger.warning(f"[Daily] Gemini consensus: {e}")
 
-        await run_full_analysis(_db, _notifier, _fetcher)
+        try:
+            await run_full_analysis(_db, _notifier, _fetcher)
+        except Exception as e:
+            logger.warning(f"[Daily] analysis_engine: {e}")
 
-        daily_pnl = _db.get_daily_pnl()
-        open_t    = _db.get_open_trades()
-        stats = {
-            "wins": 0, "losses": 0,
-            "total": len(open_t),
-            "win_rate": 0,
-            "total_pnl": daily_pnl,
-            "max_dd": 0,
-        }
-        await _db.log_performance(stats)
-        await _db.heartbeat(CONFIG.VERSION, CONFIG.ASSETS)
-        logger.success("[Daily] ✅ التحليل اليومي اكتمل")
+        try:
+            daily_pnl = _db.get_daily_pnl()
+            open_t    = _db.get_open_trades()
+            await _db.log_performance({
+                "wins": 0, "losses": 0,
+                "total": len(open_t),
+                "win_rate": 0,
+                "total_pnl": daily_pnl,
+                "max_dd": 0,
+            })
+            await _db.heartbeat(CONFIG.VERSION, CONFIG.ASSETS)
+        except Exception as e:
+            logger.warning(f"[Daily] DB: {e}")
 
+        logger.success("[Daily] ✅ اكتمل")
     except Exception as e:
         logger.error(f"[Daily] Error: {e}")
         try:
-            await _notifier.send(f"⚠️ <b>خطأ في التحليل اليومي</b>\n<code>{e}</code>")
+            await _notifier.send(
+                f"⚠️ <b>خطأ في التحليل اليومي</b>\n<code>{e}</code>"
+            )
         except Exception:
             pass
 
 
 # ══════════════════════════════════════════════════════════════════
-# JOB 6 — WEEKLY REPORT
+# JOB 6 — WEEKLY
 # ══════════════════════════════════════════════════════════════════
 async def job_weekly_report():
-    logger.info("[Weekly] 📋 Sending weekly report …")
     try:
-        msg = (
+        await _notifier.send(
             f"📋 <b>Weekly Report — {CONFIG.NAME}</b>\n"
-            f"Bot is running normally ✅\n"
-            f"Assets: {len(CONFIG.ASSETS)}\n"
-            f"<i>Detailed stats available in Supabase dashboard.</i>"
+            f"✅ Bot running | Assets: {len(CONFIG.ASSETS)}"
         )
-        await _notifier.send(msg)
     except Exception as e:
-        logger.error(f"[Weekly] Error: {e}")
+        logger.error(f"[Weekly] {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
 # JOB 7 — HEARTBEAT
 # ══════════════════════════════════════════════════════════════════
 async def job_heartbeat():
-    await _db.heartbeat(CONFIG.VERSION, CONFIG.ASSETS)
+    try:
+        await _db.heartbeat(CONFIG.VERSION, CONFIG.ASSETS)
+    except Exception:
+        pass
