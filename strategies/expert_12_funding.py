@@ -1,26 +1,21 @@
+
 """
-strategies/expert_12_funding.py — E12: Funding Rate Extreme
-Ported from GAS expert12_FundingExtreme (v100).
-When funding is extremely positive → longs crowded → SHORT contrarian.
-When funding is extremely negative → shorts crowded → LONG contrarian.
+strategies/expert_12_funding.py — E12: Funding Rate Extreme (FIXED)
+✅ إصلاح: "rate" → "funding_rate" (تطابق مع data_fetcher)
 """
 from __future__ import annotations
 from typing import Dict, Optional
 
 
 def analyze(data: Dict) -> Optional[Dict]:
-    """
-    E12 — Funding Rate Extreme.
-    Returns: {long, short, why}  scores in [0, 1]
-    """
     try:
         funding = data.get("funding", {})
-        fr      = funding.get("rate", 0.0)
+        # ✅ الإصلاح الجوهري: "funding_rate" وليس "rate"
+        fr = float(funding.get("funding_rate", funding.get("rate", 0.0)) or 0.0)
 
         long_s = short_s = 0.0
         why: Dict = {"fr_bps": round(fr * 10000, 2)}
 
-        # Extreme thresholds (mirror of GAS)
         if fr > 0.0010:
             short_s += 0.40
             why["signal"] = f"Funding EXTREME+ {fr*10000:.1f}bps — longs crowded → SHORT"
@@ -34,7 +29,6 @@ def analyze(data: Dict) -> Optional[Dict]:
             long_s += 0.22
             why["signal"] = f"Funding LOW- {fr*10000:.1f}bps"
 
-        # Sustained extreme check (if available)
         fh = data.get("funding_history", {})
         if fh:
             if fh.get("all_positive") and fh.get("avg", 0) > 0.0006:
