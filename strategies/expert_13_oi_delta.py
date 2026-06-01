@@ -1,49 +1,76 @@
+
 """
-strategies/expert_13_oi_delta.py — E13: Open Interest Delta
-Ported from GAS expert13_OIDelta (v100).
-OI rising + price rising = real trend.
-OI rising + price falling = shorts entering.
+strategies/expert_13_oi_delta.py — E13: Open Interest Delta (FIXED)
+✅ إصلاح: يعمل بدون oi_data أيضاً (fallback لـ c4h)
+OI rising + price rising  = real trend (confirm)
+OI rising + price falling = shorts entering (caution)
 """
 from __future__ import annotations
 from typing import Dict, List, Optional
 
 
 def analyze(data: Dict) -> Optional[Dict]:
-    """E13 — Open Interest Delta."""
     try:
-        oi_data = data.get("oi_data")
-        c1h     = data.get("c1h", [])
+        oi = data.get("oi_data", {})
+        c4h = data.get("c4h", [])
 
-        if not oi_data:
-            return {"name": "OIDelta", "long": 0.0, "short": 0.0,
-                    "why": {"na": "no OI data"}}
-
-        slope = oi_data.get("slope", 0.0)
         long_s = short_s = 0.0
-        why: Dict = {"oi_slope_pct": round(slope * 100, 2)}
+        why: Dict = {}
 
-        if c1h and len(c1h) >= 4:
-            p_now = float(c1h[0][4])
-            p_old = float(c1h[3][4])
-            p_slope = (p_now - p_old) / (p_old or 1)
+        # ── بيانات OI حقيقية من OKX ──────────────────────────────────
+        if oi and oi.get("oi_now") and oi.get("oi_prev"):
+            oi_now  = float(oi["oi_now"])
+            oi_prev = float(oi["oi_prev"])
+            oi_delta_pct = (oi_now - oi_prev) / max(oi_prev, 1) * 100
 
-            oi_up = slope > 0.04
-            oi_dn = slope < -0.04
-            p_up  = p_slope > 0.005
-            p_dn  = p_slope < -0.005
+            why["oi_delta_pct"] = round(oi_delta_pct, 2)
 
-            if oi_up and p_up:
-                long_s += 0.32
-                why["signal"] = "OI↑ + Price↑ = real bullish trend"
-            elif oi_up and p_dn:
-                short_s += 0.32
-                why["signal"] = "OI↑ + Price↓ = new shorts entering"
-            elif oi_dn and p_up:
-                long_s += 0.18
-                why["signal"] = "OI↓ + Price↑ = short squeeze (tactical)"
-            elif oi_dn and p_dn:
-                long_s += 0.22
-                why["signal"] = "OI↓ + Price↓ = long liquidation → possible bottom"
+            if c4h and len(c4h) >= 2:
+                price_now  = float(c4h[0][4])
+                price_prev = float(c4h[1][4])
+                price_up   = price_now > price_prev
+
+                if oi_delta_pct > 2.0 and price_up:
+                    long_s += 0.40
+                    why["signal"] = "OI↑ + Price↑ = Real Trend LONG"
+                elif oi_delta_pct > 2.0 and not price_up:
+                    short_s += 0.40
+                    why["signal"] = "OI↑ + Price↓ = Shorts entering"
+                elif oi_delta_pct < -2.0 and price_up:
+                    long_s += 0.20
+                    why["signal"] = "OI↓ + Price↑ = Shorts exiting (squeeze)"
+                elif oi_delta_pct < -2.0 and not price_up:
+                    short_s += 0.20
+                    why["signal"] = "OI↓ + Price↓ = Longs exiting"
+                else:
+                    why["signal"] = f"OI delta {oi_delta_pct:.1f}% — neutral"
+            else:
+                if oi_delta_pct > 3.0:
+                    long_s += 0.20
+                    why["signal"] = f"OI rising {oi_delta_pct:.1f}%"
+                elif oi_delta_pct < -3.0:
+                    short_s += 0.20
+                    why["signal"] = f"OI falling {oi_delta_pct:.1f}%"
+
+        # ── Fallback: volume proxy إذا لا يوجد OI ────────────────────
+        elif c4h and len(c4h) >= 6:
+            vols   = [float(c[5]) for c in c4h[:6]]
+            closes = [float(c[4]) for c in c4h[:6]]
+            avg_vol   = sum(vols[1:]) / max(len(vols[1:]), 1)
+            curr_vol  = vols[0]
+            price_up  = closes[0] > closes[1]
+            vol_surge = curr_vol > avg_vol * 1.5
+
+            if vol_surge and price_up:
+                long_s  += 0.20
+                why["signal"] = "Volume surge + Price up (OI proxy)"
+            elif vol_surge and not price_up:
+                short_s += 0.20
+                why["signal"] = "Volume surge + Price down (OI proxy)"
+            else:
+                why["signal"] = "No OI data — volume neutral"
+        else:
+            why["signal"] = "No OI or candle data"
 
         return {
             "name":  "OIDelta",
