@@ -1,3 +1,4 @@
+
 # engine/risk_manager.py — FIXED (SWING_ATR_MULT → SWING_MULT)
 from __future__ import annotations
 from typing import Dict, Optional
