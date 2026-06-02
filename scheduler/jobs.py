@@ -1,3 +1,4 @@
+
 # scheduler/jobs.py — Final version with Telegram Reply support
 # ✅ يحفظ message_id عند إرسال الإشارة
 # ✅ يرد على رسالة الإشارة الأصلية عند TP/SL
