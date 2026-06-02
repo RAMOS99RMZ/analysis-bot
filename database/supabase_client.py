@@ -1,3 +1,4 @@
+
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  database/supabase_client.py                                               ║
 # ║                                                                            ║
@@ -53,6 +54,7 @@ class SupabaseLogger:
 
     def __init__(self) -> None:
         self._client: Optional[Client] = None
+        self.client:  Optional[Client] = None   # ✅ public alias
         self._enabled: bool = False
         self._connect()
 
@@ -76,6 +78,7 @@ class SupabaseLogger:
 
         try:
             self._client = create_client(url, key)
+            self.client   = self._client   # ✅ public alias
             self._enabled = True
             logger.info("✅ Supabase connected successfully.")
         except Exception as exc:
