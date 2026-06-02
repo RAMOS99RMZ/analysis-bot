@@ -1,4 +1,3 @@
-
 # scheduler/jobs.py — Final version with Telegram Reply support
 # ✅ يحفظ message_id عند إرسال الإشارة
 # ✅ يرد على رسالة الإشارة الأصلية عند TP/SL
@@ -290,26 +289,33 @@ async def job_run_super_swing(): await _run_signal_pipeline("SUPER_SWING")
 async def job_daily_market():
     from ai.daily_consensus import run_daily_consensus
     logger.info("[Daily] 📊 بدء التحليل اليومي …")
-    try:
-        # ✅ Gemini Daily Consensus
+    
+    # ✅ Gemini Daily Consensus
     try:
         await run_daily_consensus(_notifier)
     except Exception as e:
         logger.warning(f"[Daily] Gemini: {e}")
-    if _HAS_ANALYSIS:
+        
+    try:
+        if _HAS_ANALYSIS:
             await run_full_analysis(_db, _notifier, _fetcher)
     except Exception as e:
-        logger.error(f"[Daily] {e}")
+        logger.error(f"[Daily] Analysis Engine Error: {e}")
+        
     try:
         daily_pnl = _db.get_daily_pnl()
         await _db.log_performance({
-            "wins": 0, "losses": 0,
-            "total": len(_get_open_trades()),
-            "win_rate": 0, "total_pnl": daily_pnl, "max_dd": 0,
+            "wins": 0, 
+            "losses": 0,
+            "total": len(_LOCAL_OPEN_TRADES),  # ✅ تم الإصلاح الجذري هنا
+            "win_rate": 0, 
+            "total_pnl": daily_pnl, 
+            "max_dd": 0,
         })
         await _db.heartbeat(CONFIG.VERSION, CONFIG.ASSETS)
     except Exception as e:
-        logger.warning(f"[Daily] DB: {e}")
+        logger.warning(f"[Daily] DB Logging Error: {e}")
+        
     logger.success("[Daily] ✅ اكتمل")
 
 
