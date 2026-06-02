@@ -24,41 +24,69 @@ class BacktestEngine:
         self.fetcher = DataFetcher()
         self.ie = IndicatorEngine()
 
-    # ── 1. جلب البيانات من OKX ────────────────────────────────────────
+    # ── 1. جلب البيانات من OKX بطريقة السحب المتتالي (Deep Pagination) ──
     async def _fetch_range(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> pd.DataFrame:
-        """Fetch historical OHLCV using specialized OKX History API."""
+        """Fetch historical OHLCV using deep pagination to get thousands of candles."""
         try:
             from engine.data_fetcher import _to_inst, _TF_MAP, _OKX_BASE
             inst = _to_inst(symbol)
             bar = _TF_MAP.get(timeframe, timeframe)
             
-            end_ms = int(end.timestamp() * 1000)
             start_ms = int(start.timestamp() * 1000)
+            end_ms = int(end.timestamp() * 1000)
             
-            url = f"{_OKX_BASE}/api/v5/market/history-candles?instId={inst}&bar={bar}&after={end_ms}&before={start_ms}&limit=100"
+            all_candles = []
+            current_after = end_ms
             
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.get(url)
-                data = resp.json()
-                
-                if data.get("code") != "0" or not data.get("data"):
-                    logger.warning(f"[BT] No data returned from OKX for {symbol}.")
-                    return pd.DataFrame()
+            logger.info(f"[{symbol}] ⏳ جاري سحب البيانات التاريخية العميقة... (قد يستغرق بضع ثوانٍ)")
+            
+            async with httpx.AsyncClient(timeout=30) as client:
+                while True:
+                    # نطلب 100 شمعة في كل دورة (وهو الحد الأقصى المسموح من OKX في الطلب الواحد)
+                    url = f"{_OKX_BASE}/api/v5/market/history-candles?instId={inst}&bar={bar}&after={current_after}&before={start_ms}&limit=100"
+                    resp = await client.get(url)
+                    data = resp.json()
                     
-                raw = data["data"]
-                df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"])
-                
-                # تنظيف البيانات
-                df["timestamp"] = pd.to_numeric(df["timestamp"])
-                for col in ["open", "high", "low", "close", "vol"]:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-                df.sort_values("timestamp", inplace=True)
-                df.reset_index(drop=True, inplace=True)
-                return df
-                
+                    if data.get("code") != "0" or not data.get("data"):
+                        break
+                        
+                    raw = data["data"]
+                    all_candles.extend(raw)
+                    
+                    # نأخذ التوقيت الزمني لأقدم شمعة في هذه الدفعة لنطلب ما قبلها في الدورة القادمة
+                    current_after = raw[-1][0] 
+                    
+                    if len(raw) < 100:
+                        break # وصلنا لأقدم نقطة متاحة
+                        
+                    # حماية من اللوب اللانهائي: نتوقف عند 15000 شمعة (تكفي لأشهر طويلة جداً على فريم 15 دقيقة)
+                    if len(all_candles) >= 15000:
+                        logger.info(f"[{symbol}] 🛑 تم الوصول للحد الأقصى الآمن للسحب (15000 شمعة).")
+                        break
+                        
+                    await asyncio.sleep(0.1) # نتوقف قليلاً حتى لا تقوم منصة OKX بحظر البوت (Rate Limit)
+
+            if not all_candles:
+                logger.warning(f"[{symbol}] لم يتم العثور على بيانات في هذه الفترة الزمنية.")
+                return pd.DataFrame()
+
+            # تحويل البيانات إلى DataFrame
+            df = pd.DataFrame(all_candles, columns=["timestamp", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"])
+            
+            # تنظيف البيانات وتحويلها لأرقام
+            df["timestamp"] = pd.to_numeric(df["timestamp"])
+            for col in ["open", "high", "low", "close", "vol"]:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # ترتيب الشموع من الأقدم للأحدث ليقرأها البوت بشكل صحيح
+            df.sort_values("timestamp", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            
+            logger.info(f"[{symbol}] ✅ تمت بنجاح! تم جمع {len(df)} شمعة. بدء اختبار الخبراء...")
+            return df
+            
         except Exception as e:
-            logger.error(f"[BT] Fetch error for {symbol}: {e}")
+            logger.error(f"[BT] خطأ أثناء سحب البيانات لـ {symbol}: {e}")
             return pd.DataFrame()
 
     # ── 2. محرك محاكاة البوت الحي (The Magic Happens Here) ─────────────
