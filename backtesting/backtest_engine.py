@@ -1,3 +1,4 @@
+
 """
 backtesting/backtest_engine.py — Ramos 360 Ai 🎖️
 Real backtester: BTC 4H | Jan 1 → May 1, 2026
@@ -685,7 +686,7 @@ def _metrics(sim_result: Dict, initial: float) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════
-# MAIN BACKTEST RUNNER (✅ تم الإصلاح الجذري للمُعاملات)
+# MAIN BACKTEST RUNNER
 # ═══════════════════════════════════════════════════════════
 
 class BacktestEngine:
@@ -696,26 +697,20 @@ class BacktestEngine:
     """
 
     async def run(self,
-                  symbols:    List[str] = None,
-                  timeframe:  str       = "4h",
-                  start_date: str       = "2026-01-01",
-                  end_date:   str       = "2026-05-01",
-                  balance:    float     = 10_000.0,
-                  **kwargs) -> Dict:
-
-        # 💡 توافق مع المسميات القديمة إذا تم تمريرها (مثل tf أو start)
-        tf = kwargs.get("tf", timeframe)
-        start_str = kwargs.get("start", start_date)
-        end_str = kwargs.get("end", end_date)
+                  symbols:  List[str] = None,
+                  tf:       str       = "4h",
+                  start:    str       = "2026-01-01",
+                  end:      str       = "2026-05-01",
+                  balance:  float     = 10_000.0) -> Dict:
 
         symbols = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT"]
-        start_dt = datetime.fromisoformat(start_str).replace(tzinfo=timezone.utc)
-        end_dt   = datetime.fromisoformat(end_str).replace(tzinfo=timezone.utc)
+        start_dt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+        end_dt   = datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
         results  = {}
 
         for sym in symbols:
             sym_c = sym.replace("/USDT:USDT","")
-            logger.info(f"[BT] ── Starting {sym_c} {tf} {start_str} → {end_str} ──")
+            logger.info(f"[BT] ── Starting {sym_c} {tf} {start} → {end} ──")
             try:
                 df = await fetch_full_range(sym, tf, start_dt, end_dt)
                 if df is None or df.empty or len(df) < 70:
@@ -731,7 +726,7 @@ class BacktestEngine:
                 results[sym_c] = {**stats,
                                    "symbol":    sym_c,
                                    "tf":        tf,
-                                   "period":    f"{start_str} → {end_str}",
+                                   "period":    f"{start} → {end}",
                                    "candles":   len(df)}
 
                 logger.info(
@@ -787,15 +782,15 @@ class BacktestEngine:
 
 
 # ═══════════════════════════════════════════════════════════
-# CLI Runner (✅ تم التحديث لتطابق المسميات الجديدة)
+# CLI Runner
 # ═══════════════════════════════════════════════════════════
 async def _main():
     engine  = BacktestEngine()
     results = await engine.run(
         symbols=["BTC/USDT:USDT"],
-        timeframe="4h",
-        start_date="2026-01-01",
-        end_date="2026-05-01",
+        tf="4h",
+        start="2026-01-01",
+        end="2026-05-01",
         balance=10_000.0,
     )
     report = engine.format_report(results)
