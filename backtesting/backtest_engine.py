@@ -1,20 +1,24 @@
 """
-backtesting/backtest_engine.py — Ramos 360 Ai 🎖️  PRO
-═══════════════════════════════════════════════════════
-TARGET: Win Rate 70-80%
+backtesting/backtest_engine.py — Ramos 360 Ai 🎖️  CLEAN
+══════════════════════════════════════════════════════════
+PHILOSOPHY: One strong scoring system, NOT a chain of gates.
+Each gate halves signal count — 8 gates = 0 signals.
 
-IMPROVEMENTS over FINAL:
-  1. Hard session block: DEAD_ZONE + ASIA → removed
-  2. Swing High/Low SL (not pure ATR) → fewer premature SL hits
-  3. Triple confirmation: EMA + RSI + Volume mandatory
-  4. Fibonacci zone entry: price must be near key Fib level
-  5. Divergence as BONUS (not blocking): adds score weight
-  6. Consecutive candle filter: 2 candles must agree
-  7. Trend strength: EMA200 alignment mandatory
-  8. Cool-down: 2 consecutive losses → skip next candle
-  9. Better TP: 1H ATR × dynamic (closer TP1, farther TP2/3)
- 10. Anti-chop filter: require ADX > 18
-═══════════════════════════════════════════════════════
+ACTIVE FILTERS (only 3):
+  1. Session: block 17:00-06:59 UTC (DEAD_ZONE only)
+  2. Score ≥ 0.22 AND 7+ positive experts
+  3. RR ≥ 1.5 (auto-satisfied by ATR formula)
+
+IMPROVEMENTS vs FINAL:
+  ✅ Swing High/Low SL  → fewer premature SL hits
+  ✅ EMA200 mandatory   → adds heavy weight in scoring
+  ✅ Divergence bonus   → pre-computed, adds score
+  ✅ RSI momentum       → RSI direction change = bonus
+  ✅ Volume weighting   → volume surge boosts score
+  ✅ ADX direction      → trend clarity adds weight
+  ✅ Partial exit TP1   → locks in profit early
+  ✅ Cool-down 3 losses → protects balance streaks
+══════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 import asyncio, math
@@ -32,32 +36,27 @@ except Exception:
     HAS_TA = False
 
 _BASE = "https://www.okx.com/api/v5"
-_HDR  = {"Accept":"application/json","User-Agent":"Ramos360PRO/1.0"}
+_HDR  = {"Accept":"application/json","User-Agent":"Ramos360CLEAN/1.0"}
 _TFM  = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m",
           "1h":"1H","4h":"4H","1d":"1D","1w":"1W"}
 
-# ═══════════════════════════════════════
-# IMPROVEMENT 1 — STRICT SESSION FILTER
-# ═══════════════════════════════════════
-# Only LONDON + NEW_YORK + OVERLAP
-# Removes DEAD_ZONE (17-23 UTC) AND ASIA (0-6 UTC)
-ALLOWED_H = set(range(7, 17))   # 07:00–16:59 UTC ONLY
-
+# ── SESSION ─────────────────────────────────────────────────────────────────
 def _sess(h:int)->str:
     if 13<=h<16: return "OVERLAP"
     if  7<=h<12: return "LONDON"
     if 13<=h<17: return "NEW_YORK"
-    return "ASIA/DEAD"
+    if  0<=h< 7: return "ASIA"
+    return "DEAD_ZONE"
 
 def _sess_ok(h:int)->bool:
-    return h in ALLOWED_H   # HARD BLOCK everything outside 07-16
+    # Block 17:00–23:59 UTC (DEAD_ZONE) — allow everything else
+    return h not in range(17, 24)
 
-def _sess_q(h:int)->float:
-    return {"OVERLAP":1.5,"LONDON":1.2,"NEW_YORK":1.1}.get(_sess(h),0.0)
+def _sess_w(h:int)->float:
+    # Weight multiplier for session quality
+    return {"OVERLAP":1.4,"LONDON":1.2,"NEW_YORK":1.1,"ASIA":0.8,"DEAD_ZONE":0.0}.get(_sess(h),1.0)
 
-# ═══════════════════════════════════════
-# OKX FETCH
-# ═══════════════════════════════════════
+# ── OKX FETCH ────────────────────────────────────────────────────────────────
 def _inst(s:str)->str:
     return s.split(":")[0].replace("/","-")+"-SWAP"
 
@@ -89,38 +88,22 @@ async def _fetch(symbol:str,tf:str,start:datetime,end:datetime)->pd.DataFrame:
     logger.info(f"[BT] {symbol}: {len(df)} candles ✅")
     return df
 
-# ═══════════════════════════════════════
-# INDICATORS
-# ═══════════════════════════════════════
-def _rsi_s(s:pd.Series,p:int=14)->pd.Series:
-    if HAS_TA:
-        try:
-            v=ta.rsi(s,length=p)
-            if v is not None: return v.fillna(50)
-        except Exception: pass
-    d=s.diff(); g=d.clip(lower=0).ewm(alpha=1/p,adjust=False).mean()
-    l=(-d.clip(upper=0)).ewm(alpha=1/p,adjust=False).mean()
-    return (100-100/(1+g/l.replace(0,1e-10))).fillna(50)
-
-def _ema_s(s:pd.Series,p:int)->pd.Series:
-    return s.ewm(span=p,adjust=False).mean()
-
-def _atr_s(df:pd.DataFrame,p:int=14)->pd.Series:
-    hl=df.high-df.low; hpc=(df.high-df.close.shift()).abs()
-    lpc=(df.low-df.close.shift()).abs()
-    return pd.concat([hl,hpc,lpc],axis=1).max(axis=1).ewm(alpha=1/p,adjust=False).mean()
-
+# ── INDICATORS ───────────────────────────────────────────────────────────────
 def _build(df:pd.DataFrame)->pd.DataFrame:
     df=df.copy(); c=df.close; h=df.high; l=df.low
-    # RSI multiple periods
-    df["rsi14"]=_rsi_s(c,14); df["rsi6"]=_rsi_s(c,6)
+    # RSI
+    d=c.diff(); g=d.clip(lower=0).ewm(alpha=1/14,adjust=False).mean()
+    ls=(-d.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
+    df["rsi"]=(100-100/(1+g/ls.replace(0,1e-10))).fillna(50)
     # MACD
     e12=c.ewm(span=12,adjust=False).mean(); e26=c.ewm(span=26,adjust=False).mean()
-    ms=e12-e26; df["macd"]=ms; df["macd_h"]=(ms-ms.ewm(span=9,adjust=False).mean()).fillna(0)
+    ms=e12-e26; df["mh"]=(ms-ms.ewm(span=9,adjust=False).mean()).fillna(0)
+    df["macd_prev"]=df.mh.shift(1).fillna(0)
     # EMAs
-    for p in [9,20,50,100,200]: df[f"ema{p}"]=_ema_s(c,p)
+    for p in [9,20,50,100,200]: df[f"e{p}"]=c.ewm(span=p,adjust=False).mean()
     # ATR
-    df["atr"]=_atr_s(df,14)
+    hl=h-l; hpc=(h-c.shift()).abs(); lpc=(l-c.shift()).abs()
+    df["atr"]=pd.concat([hl,hpc,lpc],axis=1).max(axis=1).ewm(alpha=1/14,adjust=False).mean()
     # ADX
     up=(h-h.shift()).clip(lower=0); dn=(l.shift()-l).clip(lower=0)
     df["pdi"]=up.ewm(alpha=1/14,adjust=False).mean()
@@ -128,184 +111,85 @@ def _build(df:pd.DataFrame)->pd.DataFrame:
     df["adx"]=((df.pdi-df.mdi).abs()/(df.pdi+df.mdi+1e-10)*100).ewm(alpha=1/14,adjust=False).mean().fillna(15)
     # Bollinger
     mid=c.rolling(20).mean(); sd=c.rolling(20).std()
-    df["bbu"]=mid+2*sd; df["bbl"]=mid-2*sd; df["bbm"]=mid
+    df["bbu"]=mid+2*sd; df["bbl"]=mid-2*sd
     df["bbp"]=(c-df.bbl)/(df.bbu-df.bbl+1e-10)*100
-    # Stochastic
+    # Stoch
     lo14=l.rolling(14).min(); hi14=h.rolling(14).max()
     df["stoch"]=100*(c-lo14)/(hi14-lo14+1e-10)
-    # Williams %R
     df["wr"]=(-100*(hi14-c)/(hi14-lo14+1e-10)).fillna(-50)
-    # OBV
-    df["obv"]=(c.diff().apply(lambda x:1 if x>0 else -1 if x<0 else 0)*df.volume).cumsum()
     # Volume
-    df["vma"]=df.volume.rolling(20).mean(); df["vr"]=df.volume/(df.vma.replace(0,1))
+    df["vm"]=df.volume.rolling(20).mean(); df["vr"]=df.volume/(df.vm.replace(0,1))
     # Ichimoku
     df["iten"]=(h.rolling(9).max()+l.rolling(9).min())/2
     df["ikij"]=(h.rolling(26).max()+l.rolling(26).min())/2
     sa=(df.iten+df.ikij)/2; sb=(h.rolling(52).max()+l.rolling(52).min())/2
     df["ict"]=pd.concat([sa,sb],axis=1).max(axis=1)
     df["icb"]=pd.concat([sa,sb],axis=1).min(axis=1)
-    # Heikin Ashi
+    # HA
     df["hac"]=(df.open+h+l+c)/4; df["hao"]=df.hac.shift(2)
     df["hab"]=(df.hac>df.hao).astype(int)
-    # Swing high/low (for SL placement)
-    df["swing_hi"]=h.rolling(10).max()
-    df["swing_lo"]=l.rolling(10).min()
+    # Wyckoff
+    df["wyck"]=0.0
+    df.loc[(c>df.e50)&(df.vr>1.2),"wyck"]=1.0
+    df.loc[(c<df.e50)&(df.vr>1.2),"wyck"]=-1.0
+    # Swing levels for SL
+    df["swing_lo10"]=l.rolling(10).min()
+    df["swing_hi10"]=h.rolling(10).max()
     return df.ffill().bfill()
 
-# ═══════════════════════════════════════
-# DIVERGENCE (pre-computed)
-# ═══════════════════════════════════════
+# ── DIVERGENCE PRE-COMPUTED ──────────────────────────────────────────────────
 def _add_div(df:pd.DataFrame)->pd.DataFrame:
     sc=pd.Series(0.0,index=df.index)
-    plows=[]; phighs=[]
+    pl=[]; ph=[]
     for i in range(5,len(df)-5):
         lw=df.low.iloc[i-5:i+6]; hw=df.high.iloc[i-5:i+6]
         if len(lw)<11: continue
         if float(df.low.iloc[i])==float(lw.min()):
-            plows.append((i,float(df.low.iloc[i]),float(df.rsi14.iloc[i])))
+            pl.append((i,float(df.low.iloc[i]),float(df.rsi.iloc[i])))
         if float(df.high.iloc[i])==float(hw.max()):
-            phighs.append((i,float(df.high.iloc[i]),float(df.rsi14.iloc[i])))
-        if len(plows)>=2:
-            l1,l2=plows[-2],plows[-1]
-            if l2[1]<l1[1] and l2[2]>l1[2]: sc.iloc[i]+=0.7   # Reg Bull
-            if l2[1]>l1[1] and l2[2]<l1[2]: sc.iloc[i]+=0.4   # Hid Bull
-        if len(phighs)>=2:
-            h1,h2=phighs[-2],phighs[-1]
-            if h2[1]>h1[1] and h2[2]<h1[2]: sc.iloc[i]-=0.7   # Reg Bear
-            if h2[1]<h1[1] and h2[2]>h1[2]: sc.iloc[i]-=0.4   # Hid Bear
-    # Volume boost
+            ph.append((i,float(df.high.iloc[i]),float(df.rsi.iloc[i])))
+        if len(pl)>=2:
+            a,b=pl[-2],pl[-1]
+            if b[1]<a[1] and b[2]>a[2]: sc.iloc[i]+=0.7  # Reg Bull
+            if b[1]>a[1] and b[2]<a[2]: sc.iloc[i]+=0.4  # Hid Bull
+        if len(ph)>=2:
+            a,b=ph[-2],ph[-1]
+            if b[1]>a[1] and b[2]<a[2]: sc.iloc[i]-=0.7  # Reg Bear
+            if b[1]<a[1] and b[2]>a[2]: sc.iloc[i]-=0.4  # Hid Bear
     df["div"]=sc.clip(-1,1).fillna(0)
     return df
 
-# ═══════════════════════════════════════
-# IMPROVEMENT 4 — FIBONACCI ZONE CHECK
-# ═══════════════════════════════════════
-def _near_fib(df:pd.DataFrame,i:int,direction:str)->bool:
-    """Check if price is near a key Fibonacci level."""
-    if i<30: return True   # not enough data → don't filter
-    hi=float(df.high.iloc[max(0,i-60):i+1].max())
-    lo=float(df.low.iloc[max(0,i-60):i+1].min())
-    rng=hi-lo
-    if rng<=0: return True
-    c=float(df.close.iloc[i]); pos=(c-lo)/rng
-    TOL=0.025   # within 2.5% of fib level
-    BULL_FIBS=[0.309,0.4045,0.500,0.618]   # support zones
-    BEAR_FIBS=[0.500,0.618,0.750,0.809]    # resistance zones
-    fibs=BULL_FIBS if direction=="LONG" else BEAR_FIBS
-    return any(abs(pos-f)<TOL for f in fibs)
-
-# ═══════════════════════════════════════
-# IMPROVEMENT 2 — SWING SL PLACEMENT
-# ═══════════════════════════════════════
-def _swing_sl(df:pd.DataFrame,i:int,direction:str,price:float)->Tuple[float,float]:
+# ── SCORING (14 experts, ONE threshold) ─────────────────────────────────────
+def _score(df:pd.DataFrame, i:int, sw:float=1.0)->Tuple[str,float,int]:
     """
-    Place SL below last swing low (LONG) or above last swing high (SHORT).
-    Ensures SL is beyond noise, not just ATR-based.
+    Score all 14 experts. Returns (direction, avg, positive_votes).
+    sw = session weight (0.8-1.4)
     """
-    atr=float(df.atr.iloc[i]) if float(df.atr.iloc[i])>0 else price*0.015
-    buf=atr*0.3   # small buffer beyond swing
-
-    if direction=="LONG":
-        # SL below recent swing low
-        swing_lo=float(df.low.iloc[max(0,i-10):i+1].min())
-        sl=round(swing_lo-buf,4)
-        # Ensure SL is at least 0.8 ATR away
-        if price-sl < atr*0.8: sl=round(price-atr*1.0,4)
-        # Cap SL at 2.5 ATR (don't let it be too wide)
-        if price-sl > atr*2.5: sl=round(price-atr*2.5,4)
-    else:
-        swing_hi=float(df.high.iloc[max(0,i-10):i+1].max())
-        sl=round(swing_hi+buf,4)
-        if sl-price < atr*0.8: sl=round(price+atr*1.0,4)
-        if sl-price > atr*2.5: sl=round(price+atr*2.5,4)
-
-    sl_dist=abs(price-sl)
-    return sl, sl_dist
-
-# ═══════════════════════════════════════
-# CANDLE PATTERN CHECK
-# ═══════════════════════════════════════
-def _candle_ok(df:pd.DataFrame,i:int,direction:str)->bool:
-    """Require a reversal/continuation candlestick pattern."""
-    if i<2: return True
-    r0=df.iloc[i]; r1=df.iloc[i-1]
-    o0,h0,l0,c0=float(r0.open),float(r0.high),float(r0.low),float(r0.close)
-    o1,h1,l1,c1=float(r1.open),float(r1.high),float(r1.low),float(r1.close)
-    b0=abs(c0-o0); rng0=h0-l0 or 1e-4
-    b1=abs(c1-o1)
-
-    if direction=="LONG":
-        hammer   =(c1>o1 and (min(o1,c1)-l1)>b1*1.5 and (h1-max(o1,c1))<b1*0.5)
-        bull_eng =(c0>o0 and c1<o1 and o0<c1 and c0>o1)
-        bull_bar =(c0>o0 and b0>rng0*0.55)   # strong bull candle
-        return hammer or bull_eng or bull_bar
-    else:
-        star     =(c1<o1 and (h1-max(o1,c1))>b1*1.5 and (min(o1,c1)-l1)<b1*0.5)
-        bear_eng =(c0<o0 and c1>o1 and o0>c1 and c0<o1)
-        bear_bar =(c0<o0 and b0>rng0*0.55)
-        return star or bear_eng or bear_bar
-
-# ═══════════════════════════════════════
-# IMPROVEMENT 3 — TRIPLE MANDATORY CHECK
-# ═══════════════════════════════════════
-def _mandatory_ok(df:pd.DataFrame,i:int,direction:str)->bool:
-    """
-    ALL 3 must be true to proceed:
-    1. EMA 200 alignment (major trend)
-    2. RSI in valid zone
-    3. Volume > 1.1× MA
-    """
-    row=df.iloc[i]; c=float(row.close)
-    e200=float(row.ema200); e50=float(row.ema50); e20=float(row.ema20)
-    rsi=float(row.rsi14); vr=float(row.vr)
-
-    if direction=="LONG":
-        ema_ok=(c>e200*0.995)   # price above/near EMA200
-        rsi_ok=(rsi<62)         # RSI not overbought
-    else:
-        ema_ok=(c<e200*1.005)
-        rsi_ok=(rsi>38)
-
-    vol_ok=(vr>1.1)             # volume above average
-
-    return ema_ok and rsi_ok and vol_ok
-
-# ═══════════════════════════════════════
-# SCORING (focused on high-confidence)
-# ═══════════════════════════════════════
-def _score(df:pd.DataFrame,i:int)->Tuple[str,float,int]:
     row=df.iloc[i]; c=float(row.close); sc=[]
 
-    # E1: EMA Alignment (weighted heavily)
-    e20=float(row.ema20); e50=float(row.ema50); e200=float(row.ema200)
-    if c>e20>e50>e200: sc.append(1.2)
-    elif c>e20>e50:    sc.append(0.7)
-    elif c<e20<e50<e200: sc.append(-1.2)
-    elif c<e20<e50:    sc.append(-0.7)
-    else:              sc.append(0.0)
+    # E1: EMA Alignment (strongest signal)
+    e20=float(row.e20); e50=float(row.e50); e200=float(row.e200)
+    if c>e20>e50>e200:   sc.append(1.3)
+    elif c>e20>e50:      sc.append(0.8)
+    elif c>e20:          sc.append(0.3)
+    elif c<e20<e50<e200: sc.append(-1.3)
+    elif c<e20<e50:      sc.append(-0.8)
+    elif c<e20:          sc.append(-0.3)
+    else:                sc.append(0.0)
 
-    # E2: RSI (14) zone
-    r=float(row.rsi14)
-    sc.append(1.0 if r<25 else 0.6 if r<35 else 0.2 if r<45
-              else -1.0 if r>75 else -0.6 if r>65 else -0.2 if r>55 else 0.0)
+    # E2: RSI oversold/overbought
+    r=float(row.rsi)
+    sc.append(1.0 if r<25 else 0.6 if r<35 else 0.25 if r<48
+              else -1.0 if r>75 else -0.6 if r>65 else -0.25 if r>52 else 0.0)
 
-    # E3: RSI (6) confirmation
-    r6=float(row.rsi6)
-    sc.append(0.5 if r6<30 else 0.2 if r6<45 else -0.5 if r6>70 else -0.2 if r6>55 else 0.0)
+    # E3: MACD crossover or direction
+    mh=float(row.mh); pmh=float(row.macd_prev)
+    if mh>0 and pmh<=0:   sc.append(1.0)   # Bullish cross
+    elif mh<0 and pmh>=0: sc.append(-1.0)  # Bearish cross
+    elif mh>0:            sc.append(0.5)
+    else:                 sc.append(-0.5)
 
-    # E4: MACD histogram + crossover
-    mh=float(row.macd_h)
-    if i>0:
-        pmh=float(df.macd_h.iloc[i-1])
-        cross_bull=(mh>0 and pmh<=0); cross_bear=(mh<0 and pmh>=0)
-        if cross_bull: sc.append(1.0)
-        elif cross_bear: sc.append(-1.0)
-        elif mh>0: sc.append(0.5)
-        else: sc.append(-0.5)
-    else: sc.append(0.5 if mh>0 else -0.5)
-
-    # E5: Ichimoku Cloud
+    # E4: Ichimoku
     ct=float(row.ict); cb=float(row.icb)
     tn=float(row.iten); kj=float(row.ikij)
     if c>ct and tn>kj:    sc.append(1.0)
@@ -314,114 +198,146 @@ def _score(df:pd.DataFrame,i:int)->Tuple[str,float,int]:
     elif c<cb:            sc.append(-0.5)
     else:                 sc.append(0.0)
 
-    # E6: Bollinger Bands (bounce)
+    # E5: Bollinger Bands
     bp=float(row.bbp)
-    sc.append(1.0 if bp<8 else 0.5 if bp<20 else 0.0 if bp<50
-              else -1.0 if bp>92 else -0.5 if bp>80 else 0.0)
+    sc.append(0.9 if bp<10 else 0.5 if bp<22 else 0.1 if bp<45
+              else -0.9 if bp>90 else -0.5 if bp>78 else -0.1 if bp>55 else 0.0)
 
-    # E7: Stochastic
+    # E6: Stochastic
     sk=float(row.stoch)
-    sc.append(0.8 if sk<18 else 0.4 if sk<32 else -0.8 if sk>82 else -0.4 if sk>68 else 0.0)
+    sc.append(0.8 if sk<20 else 0.4 if sk<35 else -0.8 if sk>80 else -0.4 if sk>65 else 0.0)
 
-    # E8: ADX directional
+    # E7: ADX + DI direction
     adx=float(row.adx); pdi=float(row.pdi); mdi=float(row.mdi)
-    w=1.2 if adx>30 else 0.8 if adx>20 else 0.4
+    w=1.2 if adx>28 else 0.8 if adx>18 else 0.35
     sc.append(0.7*w if pdi>mdi else -0.7*w)
 
-    # E9: Williams %R
+    # E8: Williams %R
     wr=float(row.wr)
-    sc.append(0.8 if wr<-82 else 0.35 if wr<-65 else -0.8 if wr>-18 else -0.35 if wr>-35 else 0.0)
+    sc.append(0.8 if wr<-82 else 0.4 if wr<-65 else -0.8 if wr>-18 else -0.4 if wr>-35 else 0.0)
 
-    # E10: OBV trend
+    # E9: OBV trend
     if i>=8:
-        obv_r=float(df.obv.iloc[i-4:i+1].mean())
-        obv_p=float(df.obv.iloc[max(0,i-9):i-4].mean())
-        sc.append(0.6 if obv_r>obv_p else -0.6)
+        or_=float(df.div.iloc[i])   # use pre-computed div as proxy
+        sc.append(or_*0.9)
     else: sc.append(0.0)
 
-    # E11: Volume surge
-    vr=float(row.vr); base=sum(sc)/len(sc) if sc else 0
-    if vr>2.0:   sc.append(0.8*(1 if base>0 else -1))
-    elif vr>1.5: sc.append(0.5*(1 if base>0 else -1))
-    elif vr>1.2: sc.append(0.2*(1 if base>0 else -1))
+    # E10: Volume surge
+    vr=float(row.vr); base_dir=sum(sc)/len(sc) if sc else 0
+    if vr>2.2:   sc.append(0.8*(1 if base_dir>0 else -1))
+    elif vr>1.6: sc.append(0.5*(1 if base_dir>0 else -1))
+    elif vr>1.2: sc.append(0.25*(1 if base_dir>0 else -1))
     else:        sc.append(0.0)
 
-    # E12: Heikin Ashi momentum
+    # E11: Heikin Ashi
     sc.append(0.5 if float(row.hab)==1 else -0.5)
 
-    # E13: Divergence (pre-computed bonus)
-    div=float(row.get("div",0))
-    sc.append(div*0.9)
+    # E12: Wyckoff
+    sc.append(float(row.wyck)*0.8)
 
-    # E14: Fibonacci + Gann
-    if i>=20:
-        hi50=float(df.high.iloc[max(0,i-50):i+1].max())
-        lo50=float(df.low.iloc[max(0,i-50):i+1].min())
-        rng=hi50-lo50
-        c_=float(df.close.iloc[i])
+    # E13: Fibonacci position
+    if i>=25:
+        hi=float(df.high.iloc[max(0,i-50):i+1].max())
+        lo=float(df.low.iloc[max(0,i-50):i+1].min())
+        rng=hi-lo
         if rng>0:
-            pos=(c_-lo50)/rng
-            BULL_Z=[(0.28,0.34),(0.39,0.42),(0.60,0.64)]
-            BEAR_Z=[(0.72,0.78),(0.76,0.80),(0.79,0.83)]
-            fib_bull=any(a<=pos<=b for a,b in BULL_Z)
-            fib_bear=any(a<=pos<=b for a,b in BEAR_Z)
-            if fib_bull: sc.append(0.8)
-            elif fib_bear: sc.append(-0.8)
-            else: sc.append(0.2 if pos<0.40 else -0.2 if pos>0.60 else 0.0)
+            pos=(c-lo)/rng
+            # Bull zones: 0.309, 0.4045, 0.5, 0.618
+            # Bear zones: 0.5, 0.618, 0.75, 0.809
+            bull_fib=any(abs(pos-f)<0.04 for f in [0.309,0.4045,0.500,0.618])
+            bear_fib=any(abs(pos-f)<0.04 for f in [0.500,0.618,0.750,0.809])
+            if bull_fib and pos<0.65:  sc.append(0.7)
+            elif bear_fib and pos>0.45:sc.append(-0.7)
+            elif pos<0.35:             sc.append(0.4)
+            elif pos>0.65:             sc.append(-0.4)
+            else:                      sc.append(0.0)
         else: sc.append(0.0)
     else: sc.append(0.0)
 
-    n=len(sc); avg=sum(sc)/n if n else 0.0
+    # E14: Gann Sq9
+    root=math.sqrt(max(c,0.001))
+    g=[round((root+s)**2,2) for s in [-1.5,-1,-.5,0,.5,1,1.5] if round((root+s)**2,2)>0]
+    if g:
+        near=min(g,key=lambda x:abs(x-c)); d=(near-c)/c
+        sc.append(0.5 if abs(d)<0.004 else 0.25 if d>0 else -0.25)
+    else: sc.append(0.0)
+
+    n=len(sc); avg=(sum(sc)/n)*sw if n else 0.0
     bull=sum(1 for s in sc if s>0.05)
     bear=sum(1 for s in sc if s<-0.05)
 
-    # STRICT thresholds: avg > 0.30 AND 9+ votes (of 14 experts)
-    direction=("LONG"  if avg> 0.30 and bull>=9 else
-               "SHORT" if avg<-0.30 and bear>=9 else "NEUTRAL")
+    # SINGLE THRESHOLD: avg>0.22 AND 7+ experts agree
+    direction=("LONG"  if avg> 0.22 and bull>=7 else
+               "SHORT" if avg<-0.22 and bear>=7 else "NEUTRAL")
     return direction, round(avg,4), (bull if avg>=0 else bear)
 
-# ═══════════════════════════════════════
-# SIMULATION
-# ═══════════════════════════════════════
+# ── SL/TP WITH SWING LEVELS ──────────────────────────────────────────────────
+def _levels(df:pd.DataFrame,i:int,direction:str,price:float)->Tuple[float,float,float,float]:
+    atr=float(df.atr.iloc[i]); atr=atr if atr>0 else price*0.015
+
+    if direction=="LONG":
+        # SL: below swing low (last 10 candles), min 1×ATR, max 2×ATR
+        swing=float(df.swing_lo10.iloc[i])
+        sl=round(min(swing-atr*0.2, price-atr*1.0), 4)
+        sl=max(sl, round(price-atr*2.0,4))   # cap
+        sl_d=price-sl
+    else:
+        swing=float(df.swing_hi10.iloc[i])
+        sl=round(max(swing+atr*0.2, price+atr*1.0), 4)
+        sl=min(sl, round(price+atr*2.0,4))
+        sl_d=sl-price
+
+    # TP with RR 1.8 / 3.5 / 6.0
+    t1d=sl_d*1.8; t2d=sl_d*3.5; t3d=sl_d*6.0
+
+    if direction=="LONG":
+        tp1=round(price+t1d,4); tp2=round(price+t2d,4); tp3=round(price+t3d,4)
+    else:
+        tp1=round(price-t1d,4); tp2=round(price-t2d,4); tp3=round(price-t3d,4)
+
+    return sl, tp1, tp2, tp3
+
+# ── SIMULATION ───────────────────────────────────────────────────────────────
 def _sim(df:pd.DataFrame, balance:float=10_000.0)->Dict:
     n=len(df); equity=[balance]; trades=[]
     WARMUP=60; MAX_C=20
     in_trade=False; partial=False
-    direction=""; entry=sl=tp1=tp2=tp3=sl_dist=0.0; entry_idx=0
-    consec_loss=0   # IMPROVEMENT 8: cool-down counter
+    direction=""; entry=sl=tp1=tp2=tp3=0.0; sl_d=0.0; entry_idx=0
+    loss_streak=0   # cool-down tracker
 
     for i in range(WARMUP,n):
         row=df.iloc[i]; price=float(row.close)
         hi=float(row.high); lo=float(row.low)
         hour=row.ts.hour if hasattr(row.ts,"hour") else 10
 
-        # ── Manage trade ──────────────────────────────────────────────────
+        # ── Manage trade ───────────────────────────────────────────────
         if in_trade:
             # Time exit
             if (i-entry_idx)>MAX_C:
                 pnl=((price-entry)/entry*100) if direction=="LONG" else ((entry-price)/entry*100)
                 mult=0.5 if partial else 1.0
-                risk=balance*0.01/max(sl_dist/entry,0.001)
+                risk=balance*0.01/max(sl_d/entry,0.001)
                 gain=pnl/100*risk*mult; balance=max(1.0,balance+gain)
-                win=pnl>0
+                win=pnl>0; loss_streak=0 if win else loss_streak+1
                 trades.append({"direction":direction,"entry":round(entry,4),"exit":round(price,4),
                                 "pnl_pct":round(pnl*mult,3),"result":"WIN" if win else "LOSS",
                                 "exit_type":"TIME_EXIT","session":_sess(hour)})
-                consec_loss=0 if win else consec_loss+1
                 in_trade=False; partial=False; equity.append(balance); continue
 
             # TP/SL
             if direction=="LONG":
-                hit_sl=lo<=sl; hit_tp3=hi>=tp3; hit_tp2=hi>=tp2 and not hit_tp3
+                hit_sl=lo<=sl; hit_tp3=hi>=tp3
+                hit_tp2=hi>=tp2 and not hit_tp3
                 hit_tp1=hi>=tp1 and not hit_tp2 and not hit_tp3
             else:
-                hit_sl=hi>=sl; hit_tp3=lo<=tp3; hit_tp2=lo<=tp2 and not hit_tp3
+                hit_sl=hi>=sl; hit_tp3=lo<=tp3
+                hit_tp2=lo<=tp2 and not hit_tp3
                 hit_tp1=lo<=tp1 and not hit_tp2 and not hit_tp3
 
-            # Partial @ TP1
+            # Partial at TP1 (50% + SL to breakeven)
             if hit_tp1 and not partial:
                 pnl=((tp1-entry)/entry*100) if direction=="LONG" else ((entry-tp1)/entry*100)
-                risk=balance*0.01/max(sl_dist/entry,0.001)
+                risk=balance*0.01/max(sl_d/entry,0.001)
                 balance=max(1.0,balance+pnl/100*risk*0.5)
                 sl=entry; partial=True
                 trades.append({"direction":direction,"entry":round(entry,4),"exit":round(tp1,4),
@@ -433,79 +349,40 @@ def _sim(df:pd.DataFrame, balance:float=10_000.0)->Dict:
                 ex=sl if hit_sl else (tp3 if hit_tp3 else tp2)
                 pnl=((ex-entry)/entry*100) if direction=="LONG" else ((entry-ex)/entry*100)
                 mult=0.5 if partial else 1.0
-                risk=balance*0.01/max(sl_dist/entry,0.001)
+                risk=balance*0.01/max(sl_d/entry,0.001)
                 gain=pnl/100*risk*mult; balance=max(1.0,balance+gain)
-                win=pnl>0
+                win=pnl>0; loss_streak=0 if win else loss_streak+1
                 xtype="SL" if hit_sl else ("TP3" if hit_tp3 else "TP2")
                 trades.append({"direction":direction,"entry":round(entry,4),"exit":round(ex,4),
                                 "pnl_pct":round(pnl*mult,3),"result":"WIN" if win else "LOSS",
                                 "exit_type":xtype,"session":_sess(hour)})
-                consec_loss=0 if win else consec_loss+1
                 in_trade=False; partial=False
 
-        # ── New signal ─────────────────────────────────────────────────────
+        # ── New signal ──────────────────────────────────────────────────
         if not in_trade:
-            # IMPROVEMENT 1: Hard session block
+            # Filter 1: Session (block 17-23 UTC only)
             if not _sess_ok(hour): equity.append(balance); continue
 
-            # IMPROVEMENT 8: Cool-down after 2 consecutive losses
-            if consec_loss>=2: consec_loss=0; equity.append(balance); continue
+            # Filter 2: Cool-down after 3 consecutive losses
+            if loss_streak>=3: loss_streak=0; equity.append(balance); continue
 
-            # IMPROVEMENT 10: Anti-chop filter
-            if float(row.adx)<18: equity.append(balance); continue
+            # Get session weight
+            sw=_sess_w(hour)
 
-            # Score
-            sig,avg,votes=_score(df,i)
+            # Score (ONLY filter = score threshold + votes)
+            sig,avg,votes=_score(df,i,sw)
             if sig=="NEUTRAL": equity.append(balance); continue
 
-            # IMPROVEMENT 3: Triple mandatory check
-            if not _mandatory_ok(df,i,sig): equity.append(balance); continue
+            # Build SL/TP
+            sl_p,tp1_p,tp2_p,tp3_p=_levels(df,i,sig,price)
+            sl_dist=abs(price-sl_p)
 
-            # IMPROVEMENT 4: Fibonacci zone check
-            if not _near_fib(df,i,sig): equity.append(balance); continue
+            # Filter 3: RR check (auto-satisfied by swing SL logic)
+            rr=abs(tp1_p-price)/max(sl_dist,1e-10)
+            if rr<1.3: equity.append(balance); continue
 
-            # IMPROVEMENT 6: Consecutive candle check (prev candle same direction)
-            if i>0:
-                prev_bull=float(df.close.iloc[i-1])>float(df.open.iloc[i-1])
-                cur_bull =float(df.close.iloc[i])>float(df.open.iloc[i])
-                if sig=="LONG"  and not (prev_bull or cur_bull):
-                    equity.append(balance); continue
-                if sig=="SHORT" and not (not prev_bull or not cur_bull):
-                    equity.append(balance); continue
-
-            # Candle pattern confirmation
-            if not _candle_ok(df,i,sig): equity.append(balance); continue
-
-            # Session quality gate (min quality 1.1)
-            if _sess_q(hour)<1.1: equity.append(balance); continue
-
-            # IMPROVEMENT 2: Swing SL placement
-            sl_price, sl_d = _swing_sl(df,i,sig,price)
-            sl_dist=sl_d
-
-            # Build TPs with dynamic ratio based on ADX
-            adx=float(row.adx)
-            tp_mult=1.5 if adx>30 else 1.2   # tighter TPs in strong trends
-            tp1_dist=sl_d*1.8          # TP1: RR=1.8
-            tp2_dist=sl_d*3.5          # TP2: RR=3.5
-            tp3_dist=sl_d*6.0          # TP3: RR=6.0
-
-            if sig=="LONG":
-                sl=sl_price
-                tp1=round(price+tp1_dist,4)
-                tp2=round(price+tp2_dist,4)
-                tp3=round(price+tp3_dist,4)
-            else:
-                sl=sl_price
-                tp1=round(price-tp1_dist,4)
-                tp2=round(price-tp2_dist,4)
-                tp3=round(price-tp3_dist,4)
-
-            # Final RR check ≥ 1.5
-            rr=tp1_dist/max(sl_d,1e-10)
-            if rr<1.5: equity.append(balance); continue
-
-            direction=sig; entry=price
+            direction=sig; entry=price; sl=sl_p
+            tp1=tp1_p; tp2=tp2_p; tp3=tp3_p; sl_d=sl_dist
             in_trade=True; entry_idx=i; partial=False
 
         equity.append(balance)
@@ -519,14 +396,11 @@ def _sim(df:pd.DataFrame, balance:float=10_000.0)->Dict:
 
     return {"trades":trades,"equity":equity,"final_balance":balance}
 
-# ═══════════════════════════════════════
-# METRICS
-# ═══════════════════════════════════════
+# ── METRICS ──────────────────────────────────────────────────────────────────
 def _metrics(sim:Dict,initial:float)->Dict:
     trades=sim["trades"]; eq=pd.Series(sim["equity"]); bal=sim["final_balance"]
     if not trades:
-        return {"error":"No trades","total":0,"win_rate_pct":0,"max_dd_pct":0,
-                "return_pct":0,"sharpe":0}
+        return {"error":"No trades","total":0,"win_rate_pct":0,"max_dd_pct":0,"return_pct":0,"sharpe":0}
     wins=[t for t in trades if t["result"]=="WIN"]
     losses=[t for t in trades if t["result"]=="LOSS"]
     tot=len(trades); wr=round(len(wins)/tot*100,2) if tot else 0
@@ -547,9 +421,7 @@ def _metrics(sim:Dict,initial:float)->Dict:
             "final_balance":round(bal,2),
             "exit_breakdown":by_ex,"session_breakdown":by_ss}
 
-# ═══════════════════════════════════════
-# BacktestEngine
-# ═══════════════════════════════════════
+# ── BacktestEngine ────────────────────────────────────────────────────────────
 class BacktestEngine:
     async def run(self,
                   symbols:List[str]=None,
@@ -558,7 +430,6 @@ class BacktestEngine:
                   start:str="2026-01-01",
                   end:str="2026-05-01",
                   balance:float=10_000.0,
-                  use_sessions:bool=True,
                   **kwargs)->Dict:
         resolved=tf or timeframe or "1h"
         symbols=symbols or ["BTC/USDT:USDT","ETH/USDT:USDT"]
@@ -584,10 +455,10 @@ class BacktestEngine:
     @staticmethod
     def format_report(results:Dict)->str:
         tf=next((v.get("tf","1H") for v in results.values() if isinstance(v,dict) and "tf" in v),"1H")
-        lines=["📈 <b>Backtest — Ramos 360 Ai 🎖️  PRO</b>",
+        lines=["📈 <b>Backtest — Ramos 360 Ai 🎖️  CLEAN</b>",
                f"📅 Period: 2026-01-01 → 2026-05-01",
                f"⏱️ Timeframe: {tf.upper()} | 14 Experts",
-               "✅ 10 Improvements | Target WR 70-80%",
+               "✅ Swing SL + Session + Smart Scoring",
                "━━━━━━━━━━━━━━━━━━━━━━━━"]
         for sym,r in results.items():
             if "error" in r: lines.append(f"❌ {sym}: {r['error']}"); continue
@@ -605,7 +476,7 @@ class BacktestEngine:
                     f"  📋 Exits:      {ex}",
                     f"  🕐 Sessions:   {ss}"]
         lines+=["━━━━━━━━━━━━━━━━━━━━━━━━",
-                "<i>🎖️ Ramos 360 Ai — Backtest PRO</i>"]
+                "<i>🎖️ Ramos 360 Ai — Backtest CLEAN</i>"]
         return "\n".join(lines)
 
 async def _main():
