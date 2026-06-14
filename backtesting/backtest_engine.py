@@ -156,7 +156,7 @@ def _add_div(df:pd.DataFrame)->pd.DataFrame:
             a,b=ph[-2],ph[-1]
             if b[1]>a[1] and b[2]<a[2]: sc.iloc[i]-=0.7  # Reg Bear
             if b[1]<a[1] and b[2]>a[2]: sc.iloc[i]-=0.4  # Hid Bear
-    df["div"]=sc.clip(-1,1).fillna(0)
+    df["div_sc"]=sc.clip(-1,1).fillna(0)
     return df
 
 # ── SCORING (14 experts, ONE threshold) ─────────────────────────────────────
@@ -218,7 +218,7 @@ def _score(df:pd.DataFrame, i:int, sw:float=1.0)->Tuple[str,float,int]:
 
     # E9: OBV trend
     if i>=8:
-        or_=float(df.div.iloc[i])   # use pre-computed div as proxy
+        or_=float(df["div_sc"].iloc[i])   # use pre-computed div as proxy
         sc.append(or_*0.9)
     else: sc.append(0.0)
 
