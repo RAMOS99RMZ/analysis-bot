@@ -1,17 +1,17 @@
 """
-backtesting/backtest_engine.py — Ramos 360 Ai 🎖️  ELITE v6
+backtesting/backtest_engine.py — Ramos 360 Ai 🎖️  ELITE v6 (Optimized)
 ══════════════════════════════════════════════════════════════
-TARGET: 70%+ Win Rate via QUALITY over QUANTITY
+TARGET: Balanced Win Rate & High Trade Frequency
 
 CORE PHILOSOPHY:
-  Only enter when 4 schools SIMULTANEOUSLY confirm:
-  1. FIBONACCI / HARMONIC: Price at key PRZ (0.309/0.4045/0.618/0.75/0.78/0.809)
-  2. MOMENTUM:  RSI oversold/overbought + MACD + OBV Institutional Flow
-  3. STRUCTURE & SMC: Candlestick reversal + FVG Mitigation + Volume
-  4. TREND: EMA Alignment + Ichimoku Cloud
+  Only enter when 4 schools SIMULTANEOUSLY confirm (Relaxed Thresholds):
+  1. FIBONACCI / HARMONIC: Price at key PRZ 
+  2. MOMENTUM: RSI + MACD + OBV (Flexible conditions)
+  3. STRUCTURE & SMC: Candlestick reversal + FVG Mitigation
+  4. TREND: EMA Alignment (Allowing counter-trend scalps with penalties)
 
   SL = Smart Fibonacci Invalidation Zone
-  TP1 = 1.4×SL → STRICT BREAKEVEN (+Fees) → TP2/3 Trailing (Faster on Shorts)
+  TP1 = 1.4×SL → STRICT BREAKEVEN (+Fees) → TP2/3 Trailing
 
 SESSIONS: LONDON(07-12) + OVERLAP(13-15) + NY(13-16) ONLY
 ══════════════════════════════════════════════════════════════
@@ -30,7 +30,7 @@ except Exception:
     HAS_TA = False
 
 _BASE = "https://www.okx.com/api/v5"
-_HDR  = {"Accept":"application/json","User-Agent":"Ramos360ELITE/6.0"}
+_HDR  = {"Accept":"application/json","User-Agent":"Ramos360ELITE/6.1"}
 _TFM  = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1H","4h":"4H","1d":"1D","1w":"1W"}
 
 # ── Custom Fibonacci Ratios ────────────────────────────────────────────────────
@@ -151,12 +151,12 @@ def _add_div(df: pd.DataFrame) -> pd.DataFrame:
             ph.append((i, float(df.high.iloc[i]), float(df.rsi14.iloc[i])))
         if len(pl) >= 2:
             a, b = pl[-2], pl[-1]
-            if b[1] < a[1] and b[2] > a[2]: sc.iloc[i] += 1.0  # Regular Bull
-            if b[1] > a[1] and b[2] < a[2]: sc.iloc[i] += 0.5  # Hidden Bull
+            if b[1] < a[1] and b[2] > a[2]: sc.iloc[i] += 1.0  
+            if b[1] > a[1] and b[2] < a[2]: sc.iloc[i] += 0.5  
         if len(ph) >= 2:
             a, b = ph[-2], ph[-1]
-            if b[1] > a[1] and b[2] < a[2]: sc.iloc[i] -= 1.0  # Regular Bear
-            if b[1] < a[1] and b[2] > a[2]: sc.iloc[i] -= 0.5  # Hidden Bear
+            if b[1] > a[1] and b[2] < a[2]: sc.iloc[i] -= 1.0  
+            if b[1] < a[1] and b[2] > a[2]: sc.iloc[i] -= 0.5  
     df["div_sc"] = sc.clip(-1.5, 1.5).fillna(0)
     return df
 
@@ -231,7 +231,7 @@ def _fib_tps(price: float, sl_d: float, direction: str, hi: float, lo: float) ->
     return tp1, tp2, tp3
 
 # ══════════════════════════════════════════════════════════════════
-# SCHOOL 1: MOMENTUM
+# SCHOOL 1: MOMENTUM (Relaxed)
 # ══════════════════════════════════════════════════════════════════
 
 def _momentum_signal(df, i, direction: str) -> Tuple[bool, float]:
@@ -242,40 +242,38 @@ def _momentum_signal(df, i, direction: str) -> Tuple[bool, float]:
     stoch = float(row.stoch); score = 0.0
 
     if direction == "LONG":
-        if rsi14 < 25:    score += 1.0
-        elif rsi14 < 35:  score += 0.7
-        elif rsi14 < 45:  score += 0.4
-        elif rsi14 > 55:  return False, 0.0  
+        if rsi14 < 35:    score += 1.0
+        elif rsi14 < 45:  score += 0.7
+        elif rsi14 < 55:  score += 0.4
+        elif rsi14 > 65:  return False, 0.0  
         if rsi14 > rsip: score += 0.3
-        if rsi6 < 30: score += 0.4
+        if rsi6 < 40: score += 0.4
         if mh > 0 and mhp <= 0: score += 0.8   
         elif mh > 0:             score += 0.4
         elif mh < 0:             score -= 0.2   
         if obv > obv_m:  score += 0.4
         else:            score -= 0.1
-        if stoch < 20:   score += 0.5
-        elif stoch < 35: score += 0.2
-        elif stoch > 70: return False, 0.0  
+        if stoch < 30:   score += 0.5
+        elif stoch < 50: score += 0.2
     else:  
-        if rsi14 > 75:   score += 1.0
-        elif rsi14 > 65: score += 0.7
-        elif rsi14 > 55: score += 0.4
-        elif rsi14 < 45: return False, 0.0
+        if rsi14 > 65:   score += 1.0
+        elif rsi14 > 55: score += 0.7
+        elif rsi14 > 45: score += 0.4
+        elif rsi14 < 35: return False, 0.0
         if rsi14 < rsip: score += 0.3
-        if rsi6 > 70:    score += 0.4
+        if rsi6 > 60:    score += 0.4
         if mh < 0 and mhp >= 0: score += 0.8
         elif mh < 0:             score += 0.4
         elif mh > 0:             score -= 0.2
         if obv < obv_m:  score += 0.4
         else:            score -= 0.1
-        if stoch > 80:   score += 0.5
-        elif stoch > 65: score += 0.2
-        elif stoch < 30: return False, 0.0
+        if stoch > 70:   score += 0.5
+        elif stoch > 50: score += 0.2
 
-    return score >= 0.7, round(score, 3)
+    return score >= 0.4, round(score, 3)
 
 # ══════════════════════════════════════════════════════════════════
-# SCHOOL 2: STRUCTURE & SMC (FVG + Candlestick)
+# SCHOOL 2: STRUCTURE & SMC (Relaxed)
 # ══════════════════════════════════════════════════════════════════
 
 def _structure_signal(df, i, direction: str) -> Tuple[bool, float]:
@@ -290,53 +288,50 @@ def _structure_signal(df, i, direction: str) -> Tuple[bool, float]:
     b1=abs(c1-o1); rng1=h1-l1 or 1e-4
     vr = float(r0.vr)
 
-    # SMC FVG Mitigation Logic
     fvg_bull_mitigated = float(r1.fvg_bull) == 1 and l0 <= float(r2.high)
     fvg_bear_mitigated = float(r1.fvg_bear) == 1 and h0 >= float(r2.low)
 
     if direction == "LONG":
-        hammer = (c1>o1 or c0>o0) and (min(o1,c1)-l1) > b1*1.8 and (h1-max(o1,c1)) < b1*0.4
+        hammer = (c1>o1 or c0>o0) and (min(o1,c1)-l1) > b1*1.5 and (h1-max(o1,c1)) < b1*0.6
         bull_eng = c0>o0 and c1<o1 and o0<=c1 and c0>=o1
-        doji_mid = b1 < rng1*0.3
+        doji_mid = b1 < rng1*0.4
         morn_star = c2<o2 and doji_mid and c0>o0 and c0>((o2+c2)/2)
-        strong_bull = c0>o0 and b0>rng0*0.60
-        pin_bar = (min(o0,c0)-l0)>b0*2.0 and (h0-max(o0,c0))<b0*0.3
+        strong_bull = c0>o0 and b0>rng0*0.50
+        pin_bar = (min(o0,c0)-l0)>b0*1.5 and (h0-max(o0,c0))<b0*0.5
 
         if morn_star:   score += 1.0
         elif bull_eng:  score += 0.9
         elif hammer or pin_bar: score += 0.8
-        elif strong_bull: score += 0.6
+        elif strong_bull: score += 0.5
         else:           return False, 0.0  
 
-        if fvg_bull_mitigated: score += 0.5  # SMC Boost
-        if vr > 2.0:   score += 0.8
-        elif vr > 1.5: score += 0.5
-        elif vr > 1.2: score += 0.3
+        if fvg_bull_mitigated: score += 0.5  
+        if vr > 1.5:   score += 0.6
+        elif vr > 1.0: score += 0.3
         elif vr < 0.7: score -= 0.3  
 
     else:  
-        shoot_star = (c1<o1 or c0<o0) and (h1-max(o1,c1)) > b1*1.8 and (min(o1,c1)-l1) < b1*0.4
+        shoot_star = (c1<o1 or c0<o0) and (h1-max(o1,c1)) > b1*1.5 and (min(o1,c1)-l1) < b1*0.6
         bear_eng = c0<o0 and c1>o1 and o0>=c1 and c0<=o1
-        even_star = c2>o2 and b1<rng1*0.3 and c0<o0 and c0<((o2+c2)/2)
-        strong_bear = c0<o0 and b0>rng0*0.60
-        pin_bear = (h0-max(o0,c0))>b0*2.0 and (min(o0,c0)-l0)<b0*0.3
+        even_star = c2>o2 and b1<rng1*0.4 and c0<o0 and c0<((o2+c2)/2)
+        strong_bear = c0<o0 and b0>rng0*0.50
+        pin_bear = (h0-max(o0,c0))>b0*1.5 and (min(o0,c0)-l0)<b0*0.5
 
         if even_star:   score += 1.0
         elif bear_eng:  score += 0.9
         elif shoot_star or pin_bear: score += 0.8
-        elif strong_bear: score += 0.6
+        elif strong_bear: score += 0.5
         else:           return False, 0.0
 
-        if fvg_bear_mitigated: score += 0.5  # SMC Boost
-        if vr > 2.0:   score += 0.8
-        elif vr > 1.5: score += 0.5
-        elif vr > 1.2: score += 0.3
+        if fvg_bear_mitigated: score += 0.5  
+        if vr > 1.5:   score += 0.6
+        elif vr > 1.0: score += 0.3
         elif vr < 0.7: score -= 0.3
 
-    return score >= 0.8, round(score, 3)
+    return score >= 0.5, round(score, 3)
 
 # ══════════════════════════════════════════════════════════════════
-# SCHOOL 3: TREND
+# SCHOOL 3: TREND (Relaxed)
 # ══════════════════════════════════════════════════════════════════
 
 def _trend_signal(df, i, direction: str) -> Tuple[bool, float]:
@@ -348,7 +343,7 @@ def _trend_signal(df, i, direction: str) -> Tuple[bool, float]:
         if c > e20 > e50 > e200: score += 1.0   
         elif c > e50 > e200:     score += 0.7   
         elif c > e200:           score += 0.4   
-        elif c < e50 < e200:     return False, 0.0  
+        elif c < e50 < e200:     score -= 0.5 
         if c > ct:               score += 0.5   
         elif c > cb:             score += 0.2   
         elif c < cb:             score -= 0.2   
@@ -359,7 +354,7 @@ def _trend_signal(df, i, direction: str) -> Tuple[bool, float]:
         if c < e20 < e50 < e200: score += 1.0
         elif c < e50 < e200:     score += 0.7
         elif c < e200:           score += 0.4
-        elif c > e50 > e200:     return False, 0.0
+        elif c > e50 > e200:     score -= 0.5
         if c < cb:               score += 0.5
         elif c < ct:             score += 0.2
         elif c > ct:             score -= 0.2
@@ -367,7 +362,7 @@ def _trend_signal(df, i, direction: str) -> Tuple[bool, float]:
         elif div < 0:            score += 0.4
         elif div > 0.5:          score -= 0.5
 
-    return score >= 0.5, round(score, 3)
+    return score >= 0.2, round(score, 3)
 
 # ══════════════════════════════════════════════════════════════════
 # FINAL DECISION
@@ -574,10 +569,10 @@ class BacktestEngine:
     @staticmethod
     def format_report(results:Dict)->str:
         tf=next((v.get("tf","1H") for v in results.values() if isinstance(v,dict) and "tf" in v),"1H")
-        lines=["📈 <b>Backtest — Ramos 360 Ai 🎖️  ELITE v6</b>",
+        lines=["📈 <b>Backtest — Ramos 360 Ai 🎖️  ELITE v6.1 (Optimized)</b>",
                f"📅 Period: 2026-01-01 → 2026-05-01",
                f"⏱️ Timeframe: {tf.upper()} | Institutional Grade",
-               "✅ FVG Mitigation + Strict Breakeven + Dynamic Shorts",
+               "✅ Balanced Thresholds + Strict Breakeven + Dynamic Shorts",
                "━━━━━━━━━━━━━━━━━━━━━━━━"]
         for sym,r in results.items():
             if "error" in r: lines.append(f"❌ {sym}: {r['error']}"); continue
@@ -595,7 +590,7 @@ class BacktestEngine:
                     f"  📋 Exits:      {ex}",
                     f"  🕐 Sessions:   {ss}"]
         lines+=["━━━━━━━━━━━━━━━━━━━━━━━━",
-                "<i>🎖️ Ramos 360 Ai — ELITE v6</i>"]
+                "<i>🎖️ Ramos 360 Ai — ELITE v6.1</i>"]
         return "\n".join(lines)
 
 async def _main():
