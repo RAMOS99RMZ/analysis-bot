@@ -770,7 +770,7 @@ class BacktestEngine:
         resolved = tf or timeframe or "1h"
 
         # ── Symbol normalization + ETH/XRP guarantee ──
-        raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT"]
+        raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT", "LINK/USDT:USDT"]
         symbols = []
         seen = set()
         for s in raw:
@@ -876,7 +876,7 @@ class BacktestEngine:
 
 async def _main():
     e = BacktestEngine()
-    r = await e.run(symbols=["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT"], timeframe="1h",
+    r = await e.run(symbols=["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT", "LINK/USDT:USDT"], timeframe="1h",
                     start="2026-01-01", end="2026-05-01", balance=10_000.0)
     print("\n" + e.format_report(r).replace("<b>","").replace("</b>","")
           .replace("<i>","").replace("</i>",""))
