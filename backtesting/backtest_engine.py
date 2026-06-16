@@ -91,6 +91,22 @@ class BTConfig:
     intrabar_smart: bool = True           # إن كان TP1 أقرب بكثير من SL → TP1 أولاً
     intrabar_tp_ratio: float = 0.55       # TP1_dist / SL_dist < 0.55 ⇒ TP أولاً
 
+    # ── Quality Gates (NEW v9) — بوابات جودة إضافية لا تمسّ المنطق التحليلي ──
+    # 1) Kaufman Efficiency Ratio: يقيس "نقاء" الاتجاه (0=تذبذب، 1=اتجاه نظيف)
+    er_enable: bool = True
+    er_period: int = 10                   # نافذة قياس الكفاءة
+    er_min: float = 0.42                  # نمنع الدخول إن كانت الكفاءة أقل (تذبذب) — مضبوط
+    er_bonus: float = 0.6                 # أقصى مكافأة ثقة عند كفاءة عالية (لحجم المخاطرة)
+
+    # 2) Equity Circuit Breaker: يوقف الصفقات الجديدة عند تراكم خسارة لحماية رأس المال
+    dd_breaker_enable: bool = True
+    dd_breaker_pct: float = 8.0           # إيقاف الدخول عند هبوط ≥ 8% من القمة
+    dd_resume_pct: float = 4.0            # استئناف الدخول عند تعافي الهبوط إلى ≤ 4%
+
+    # 3) Adaptive Risk: تقليل حجم المخاطرة بعد الخسائر (يتعافى عند الربح)
+    loss_risk_decay: float = 0.55         # ضرب المخاطرة بهذا بعد كل خسارة متتالية
+    loss_risk_floor: float = 0.40         # حد أدنى لا تنزل المخاطرة تحته
+
 
 FIBO_RET = [0.236, 0.382, 0.5, 0.618, 0.705, 0.786]
 FIBO_EXT = [1.272, 1.414, 1.618, 2.0, 2.618]
@@ -198,7 +214,7 @@ async def _fetch(symbol: str, tf: str, start: datetime, end: datetime) -> pd.Dat
 # ══════════════════════════════════════════════════════════════════
 # INDICATORS
 # ══════════════════════════════════════════════════════════════════
-def _build(df: pd.DataFrame) -> pd.DataFrame:
+def _build(df: pd.DataFrame, er_period: int = 10) -> pd.DataFrame:
     df = df.copy(); c = df.close; h = df.high; l = df.low
     for p in [6, 14]:
         d = c.diff(); g = d.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
@@ -232,6 +248,11 @@ def _build(df: pd.DataFrame) -> pd.DataFrame:
     body = (c - df.open).abs(); rng = (h - l).replace(0, 1e-6)
     df["body_r"] = (body / rng).fillna(0.5)
     df["slo14"] = l.rolling(14).min(); df["shi14"] = h.rolling(14).max()
+    # ── Kaufman Efficiency Ratio (NEW v9) — نقاء الاتجاه (causal) ──
+    erp = max(2, int(er_period))
+    net_change = (c - c.shift(erp)).abs()
+    volatility = c.diff().abs().rolling(erp).sum()
+    df["er"] = (net_change / volatility.replace(0, 1e-10)).clip(0, 1).fillna(0)
     return df.ffill().bfill()
 
 
@@ -573,6 +594,7 @@ def _sim(df: pd.DataFrame, cfg: BTConfig, balance: float = 10_000.0,
     pos_frac = 1.0
     hit_tp1 = hit_tp2 = False
     consec_loss = 0; risk_dollars = 0.0
+    peak_balance = balance; breaker_paused = False   # NEW v9: equity circuit breaker
 
     def close_leg(exit_price: float, frac: float, etype: str, force_dir: str):
         nonlocal balance, consec_loss
@@ -666,9 +688,23 @@ def _sim(df: pd.DataFrame, cfg: BTConfig, balance: float = 10_000.0,
             equity.append(balance); continue
 
         # ───────── look for new entry ─────────
+        # ── Equity Circuit Breaker (NEW v9): حماية رأس المال عند تراكم الخسائر ──
+        if cfg.dd_breaker_enable:
+            peak_balance = max(peak_balance, balance)
+            dd_now = (peak_balance - balance) / peak_balance * 100 if peak_balance > 0 else 0.0
+            if not breaker_paused and dd_now >= cfg.dd_breaker_pct:
+                breaker_paused = True
+            elif breaker_paused and dd_now <= cfg.dd_resume_pct:
+                breaker_paused = False
+            if breaker_paused:
+                equity.append(balance); continue
+
         if not _sess_ok(hour, cfg):
             equity.append(balance); continue
         if _is_noisy(df, i):
+            equity.append(balance); continue
+        # ── Efficiency Ratio gate (NEW v9): تجنّب الأسواق المتذبذبة ──
+        if cfg.er_enable and "er" in df.columns and float(row.er) < cfg.er_min:
             equity.append(balance); continue
         if consec_loss >= cfg.max_consec_loss:
             consec_loss = 0; equity.append(balance); continue
@@ -695,7 +731,11 @@ def _sim(df: pd.DataFrame, cfg: BTConfig, balance: float = 10_000.0,
         entry_sess = _sess(hour); entry_idx = i
         in_trade = True; pos_frac = 1.0; hit_tp1 = hit_tp2 = False
         conf = min(1.2, max(0.6, score / cfg.base_threshold))
-        risk_dollars = balance * cfg.risk_per_trade * conf
+        # ── Adaptive Risk (NEW v9): ثقة أعلى عند كفاءة اتجاه عالية + تقليل بعد الخسائر ──
+        er_now = float(row.er) if (cfg.er_enable and "er" in df.columns) else 0.0
+        conf *= (1.0 + cfg.er_bonus * er_now)
+        decay = max(cfg.loss_risk_floor, cfg.loss_risk_decay ** consec_loss)
+        risk_dollars = balance * cfg.risk_per_trade * conf * decay
         equity.append(balance)
 
     if in_trade:
@@ -806,7 +846,7 @@ class BacktestEngine:
                     results[sym_c] = {"error": msg, "symbol": sym_c, "tf": resolved,
                                        "period": f"{start}→{end}"}
                     continue
-                df = _build(df); df = _add_div(df)
+                df = _build(df, er_period=self.cfg.er_period); df = _add_div(df)
 
                 # ── MTF fetch (4H by default) ──
                 df_mtf = pd.DataFrame()
@@ -839,10 +879,10 @@ class BacktestEngine:
         tf = next((v.get("tf","1H") for v in results.values() if isinstance(v, dict) and "tf" in v), "1H")
         mtf = next((v.get("mtf","—") for v in results.values() if isinstance(v, dict) and "mtf" in v), "—")
         period = next((v.get("period","") for v in results.values() if isinstance(v, dict) and "period" in v), "")
-        lines = ["📈 <b>Backtest — Ramos 360 Ai 🎖️  ELITE v8 (AI Confluence + MTF)</b>",
+        lines = ["📈 <b>Backtest — Ramos 360 Ai 🎖️  ELITE v9 (AI Confluence + MTF + Quality Gates)</b>",
                  f"📅 Period: {period}",
                  f"⏱️ Timeframe: {tf.upper()} | HTF Bias: {mtf.upper()} | Trend-Pullback + Multi-Target",
-                 "✅ Causal (no look-ahead) + Fees/Slippage + Scaled TP1/TP2/TP3 + MTF Filter",
+                 "✅ Causal + Fees/Slippage + Scaled TP1/TP2/TP3 + MTF + ER Gate + DD Breaker",
                  "━━━━━━━━━━━━━━━━━━━━━━━━"]
         agg = {"total":0,"wins":0,"losses":0,"ret":0.0,"tp1":0,"tp2":0,"tp3":0,"sl":0}
         for sym, r in results.items():
@@ -878,7 +918,7 @@ class BacktestEngine:
                       f"  🎯 Win Rate:     {wr_agg:.1f}%",
                       f"  💰 Avg Return:   {agg['ret']/max(1,len([r for r in results.values() if 'error' not in r])):+.2f}%",
                       f"  🏁 Targets:      TP1:{agg['tp1']} TP2:{agg['tp2']} TP3:{agg['tp3']}  |  SL:{agg['sl']}"]
-        lines += ["━━━━━━━━━━━━━━━━━━━━━━━━", "<i>🎖️ Ramos 360 Ai — ELITE v8 (MTF)</i>"]
+        lines += ["━━━━━━━━━━━━━━━━━━━━━━━━", "<i>🎖️ Ramos 360 Ai — ELITE v9 (Quality Gates)</i>"]
         return "\n".join(lines)
 
 
