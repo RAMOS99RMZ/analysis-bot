@@ -113,13 +113,18 @@ def _sess_ok(h: int, cfg: BTConfig) -> bool:
 # OKX FETCH
 # ══════════════════════════════════════════════════════════════════
 def _inst(s: str) -> str:
+    """OKX perpetual swap instrument id, e.g. BTC/USDT:USDT → BTC-USDT-SWAP."""
     return s.split(":")[0].replace("/", "-") + "-SWAP"
 
-async def _fetch(symbol: str, tf: str, start: datetime, end: datetime) -> pd.DataFrame:
-    inst = _inst(symbol); bar = _TFM.get(tf.lower(), tf)
-    s_ms = int(start.timestamp() * 1000); e_ms = int(end.timestamp() * 1000)
-    rows = []; before = e_ms
-    logger.info(f"[BT] {symbol} {tf} {start.date()}→{end.date()}")
+def _inst_spot(s: str) -> str:
+    """OKX spot instrument id (fallback), e.g. ETH/USDT:USDT → ETH-USDT."""
+    return s.split(":")[0].replace("/", "-")
+
+async def _fetch_one(inst: str, bar: str, s_ms: int, e_ms: int) -> List[list]:
+    """Low-level paged OHLCV fetch from OKX for a given instId."""
+    rows: List[list] = []
+    before = e_ms
+    empty_pages = 0
     async with httpx.AsyncClient(timeout=30, headers=_HDR) as cl:
         while True:
             try:
@@ -127,28 +132,66 @@ async def _fetch(symbol: str, tf: str, start: datetime, end: datetime) -> pd.Dat
                     "instId": inst, "bar": bar,
                     "before": str(s_ms), "after": str(before), "limit": "300"})
             except Exception as e:
-                logger.warning(f"[BT] fetch retry: {e}"); await asyncio.sleep(2); continue
+                logger.warning(f"[BT] fetch retry ({inst}): {e}")
+                await asyncio.sleep(2); continue
             if r.status_code == 429:
                 await asyncio.sleep(5); continue
             if r.status_code != 200:
+                logger.warning(f"[BT] {inst} HTTP {r.status_code}")
                 break
             j = r.json()
-            if j.get("code") != "0" or not j.get("data"):
+            if j.get("code") != "0":
+                logger.warning(f"[BT] {inst} API code={j.get('code')} msg={j.get('msg')}")
                 break
-            for c in j["data"]:
+            data = j.get("data") or []
+            if not data:
+                empty_pages += 1
+                if empty_pages >= 2: break
+                await asyncio.sleep(0.3); continue
+            for c in data:
                 ts = int(c[0])
                 if s_ms <= ts <= e_ms:
                     rows.append([ts, float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
-            old = int(j["data"][-1][0])
-            if old <= s_ms or len(j["data"]) < 300:
+            old = int(data[-1][0])
+            if old <= s_ms or len(data) < 300:
                 break
-            before = old; await asyncio.sleep(0.3)
+            before = old
+            await asyncio.sleep(0.3)
+    return rows
+
+async def _fetch(symbol: str, tf: str, start: datetime, end: datetime) -> pd.DataFrame:
+    """
+    Resilient fetch with multi-instrument fallback:
+      1) Perpetual SWAP (e.g. ETH-USDT-SWAP)
+      2) SPOT pair       (e.g. ETH-USDT)
+    Logs clearly which source succeeded so ETH never disappears silently.
+    """
+    bar = _TFM.get(tf.lower(), tf)
+    s_ms = int(start.timestamp() * 1000); e_ms = int(end.timestamp() * 1000)
+    logger.info(f"[BT] {symbol} {tf} {start.date()}→{end.date()}")
+
+    candidates = [("SWAP", _inst(symbol)), ("SPOT", _inst_spot(symbol))]
+    rows: List[list] = []
+    used = None
+    for kind, inst in candidates:
+        try:
+            rows = await _fetch_one(inst, bar, s_ms, e_ms)
+        except Exception as e:
+            logger.warning(f"[BT] {symbol} {kind} ({inst}) error: {e}")
+            rows = []
+        if rows:
+            used = f"{kind}:{inst}"
+            break
+        logger.warning(f"[BT] {symbol} {kind} ({inst}) returned 0 rows — trying next source")
+
     if not rows:
+        logger.error(f"[BT] {symbol} {tf}: ALL sources failed (SWAP+SPOT) — no data")
         return pd.DataFrame()
+
     df = pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
     df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    logger.info(f"[BT] {symbol} {tf}: {len(df)} candles ✅")
+    logger.info(f"[BT] {symbol} {tf}: {len(df)} candles ✅ via {used}")
     return df
 
 
@@ -707,11 +750,37 @@ class BacktestEngine:
     def __init__(self, cfg: Optional[BTConfig] = None):
         self.cfg = cfg or BTConfig()
 
+    @staticmethod
+    def _normalize_symbol(s: str) -> str:
+        """Accept BTC | BTCUSDT | BTC/USDT | BTC-USDT | BTC/USDT:USDT → BTC/USDT:USDT."""
+        if not s: return ""
+        x = s.strip().upper().replace("-", "/")
+        if ":" in x: return x
+        if "/" in x:
+            base, _, _quote = x.partition("/")
+            return f"{base}/USDT:USDT"
+        if x.endswith("USDT") and len(x) > 4:
+            return f"{x[:-4]}/USDT:USDT"
+        return f"{x}/USDT:USDT"
+
     async def run(self, symbols: List[str] = None, timeframe: str = "1h", tf: str = None,
                   start: str = "2026-01-01", end: str = "2026-05-01",
-                  balance: float = 10_000.0, **kwargs) -> Dict:
+                  balance: float = 10_000.0, force_eth: bool = True, **kwargs) -> Dict:
         resolved = tf or timeframe or "1h"
-        symbols = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+
+        # ── Symbol normalization + ETH guarantee ──
+        raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+        symbols = []
+        seen = set()
+        for s in raw:
+            n = self._normalize_symbol(s)
+            if n and n not in seen:
+                symbols.append(n); seen.add(n)
+        if force_eth and "ETH/USDT:USDT" not in seen:
+            symbols.append("ETH/USDT:USDT")
+            logger.info("[BT] force_eth=True → ETH/USDT:USDT auto-added")
+        logger.info(f"[BT] symbols to test: {symbols}")
+
         sdt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
         edt = datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
         results = {}
@@ -720,7 +789,11 @@ class BacktestEngine:
             try:
                 df = await _fetch(sym, resolved, sdt, edt)
                 if df is None or len(df) < 80:
-                    results[sym_c] = {"error":"insufficient data"}; continue
+                    msg = f"insufficient data ({0 if df is None else len(df)} candles)"
+                    logger.error(f"[BT] {sym_c}: {msg}")
+                    results[sym_c] = {"error": msg, "symbol": sym_c, "tf": resolved,
+                                       "period": f"{start}→{end}"}
+                    continue
                 df = _build(df); df = _add_div(df)
 
                 # ── MTF fetch (4H by default) ──
@@ -744,7 +817,9 @@ class BacktestEngine:
                             f"WR={st.get('win_rate_pct',0)}% Ret={st.get('return_pct',0):+.2f}% "
                             f"PF={st.get('profit_factor',0)}")
             except Exception as e:
-                logger.exception(f"[BT] {sym_c}: {e}"); results[sym_c] = {"error":str(e)}
+                logger.exception(f"[BT] {sym_c}: {e}")
+                results[sym_c] = {"error": str(e), "symbol": sym_c, "tf": resolved,
+                                   "period": f"{start}→{end}"}
         return results
 
     @staticmethod
