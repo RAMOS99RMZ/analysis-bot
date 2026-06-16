@@ -765,11 +765,12 @@ class BacktestEngine:
 
     async def run(self, symbols: List[str] = None, timeframe: str = "1h", tf: str = None,
                   start: str = "2026-01-01", end: str = "2026-05-01",
-                  balance: float = 10_000.0, force_eth: bool = True, **kwargs) -> Dict:
+                  balance: float = 10_000.0, force_eth: bool = True,
+                  force_xrp: bool = True, **kwargs) -> Dict:
         resolved = tf or timeframe or "1h"
 
-        # ── Symbol normalization + ETH guarantee ──
-        raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+        # ── Symbol normalization + ETH/XRP guarantee ──
+        raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT"]
         symbols = []
         seen = set()
         for s in raw:
@@ -777,8 +778,11 @@ class BacktestEngine:
             if n and n not in seen:
                 symbols.append(n); seen.add(n)
         if force_eth and "ETH/USDT:USDT" not in seen:
-            symbols.append("ETH/USDT:USDT")
+            symbols.append("ETH/USDT:USDT"); seen.add("ETH/USDT:USDT")
             logger.info("[BT] force_eth=True → ETH/USDT:USDT auto-added")
+        if force_xrp and "XRP/USDT:USDT" not in seen:
+            symbols.append("XRP/USDT:USDT"); seen.add("XRP/USDT:USDT")
+            logger.info("[BT] force_xrp=True → XRP/USDT:USDT auto-added")
         logger.info(f"[BT] symbols to test: {symbols}")
 
         sdt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
@@ -872,7 +876,7 @@ class BacktestEngine:
 
 async def _main():
     e = BacktestEngine()
-    r = await e.run(symbols=["BTC/USDT:USDT", "ETH/USDT:USDT"], timeframe="1h",
+    r = await e.run(symbols=["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT"], timeframe="1h",
                     start="2026-01-01", end="2026-05-01", balance=10_000.0)
     print("\n" + e.format_report(r).replace("<b>","").replace("</b>","")
           .replace("<i>","").replace("</i>",""))
