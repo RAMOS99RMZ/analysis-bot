@@ -1170,6 +1170,438 @@ def sim_alt(df: pd.DataFrame, cfg: AltConfig, balance: float = 10_000.0, df_mtf=
     return {"trades": trades, "equity": equity, "final_balance": balance, "start_balance": start}
 
 
+# ══════════════════════════════════════════════════════════════════════════════════
+# ████ MACRO QUANT ENGINE — Ramos 360 Ai 🎖️  ELITE v11 (XAU/XAG/SPX/NDX) ████
+# ──────────────────────────────────────────────────────────────────────────────────
+# Dedicated engine for Gold, Silver and US Index FUTURES (ES=SPX, NQ=Nasdaq).
+# Data source: Yahoo Finance (free, no API key) — uses CONTINUOUS futures:
+#   • XAUUSD/GOLD   → GC=F   (Gold futures, ~23h/day, no weekend gaps issues)
+#   • XAGUSD/SILVER → SI=F   (Silver futures)
+#   • SPX/ES        → ES=F   (E-mini S&P 500 futures)
+#   • NDX/NASDAQ/NQ → NQ=F   (E-mini Nasdaq-100 futures)
+# Why futures: trade ~23h/day → far fewer overnight gaps than spot indices.
+# Schools combined (causal): Harmonic (all 5) + Classic (Double Top/Bottom, H&S) +
+# SMC (sweep + premium/discount) + Candles + RSI/MACD/OBV Divergences +
+# Fibonacci Golden Ratios (0.618 / 0.786 / 1.272 / 1.618) + Swing Extremes (HH/LL).
+# BTC/ETH (ELITE v8) and Alt (ALT-Q v10) engines are NOT touched.
+# ══════════════════════════════════════════════════════════════════════════════════
+
+MACRO_SYMBOLS = {"XAUUSD", "XAGUSD", "SPX", "NDX", "NASDAQ", "GOLD", "SILVER", "ES", "NQ"}
+
+MACRO_YF_MAP = {
+    "XAUUSD":  "GC=F",  "GOLD":    "GC=F",
+    "XAGUSD":  "SI=F",  "SILVER":  "SI=F",
+    "SPX":     "ES=F",  "ES":      "ES=F",
+    "NDX":     "NQ=F",  "NASDAQ":  "NQ=F",  "NQ": "NQ=F",
+}
+
+# Display names for the report
+MACRO_DISPLAY = {
+    "XAUUSD": "🥇 GOLD (XAU/USD · GC=F)",
+    "XAGUSD": "🥈 SILVER (XAG/USD · SI=F)",
+    "SPX":    "📊 SPX (E-mini ES=F)",
+    "NDX":    "💻 NASDAQ-100 (E-mini NQ=F)",
+}
+
+
+@dataclass
+class MacroConfig:
+    """Macro futures engine — tuned for gold/silver/indices (lower noise than alts)."""
+    # risk & sizing
+    risk_per_trade: float = 0.013
+    risk_cap: float = 0.022
+    fee_rate: float = 0.00015          # futures commissions are tiny
+    slippage: float = 0.00015
+    # targets
+    tp1_r: float = 1.3
+    tp2_r: float = 2.2
+    tp3_r: float = 3.6
+    tp1_frac: float = 0.5
+    tp2_frac: float = 0.3
+    # stop
+    sl_atr_min: float = 1.5
+    sl_atr_max: float = 2.8
+    sl_buffer_atr: float = 0.18
+    chandelier_atr: float = 2.6
+    # gating
+    min_rr: float = 1.15
+    max_hold_bars: int = 60
+    max_consec_loss: int = 3
+    allow_asia: bool = True            # futures trade 23h → ASIA session valid
+    # quality gates
+    er_min: float = 0.30
+    adx_min: float = 14.0
+    vol_min: float = 0.6
+    threshold: float = 2.2             # confluence score gate (strict)
+    # zigzag / patterns
+    zz_atr: float = 1.9
+    harmonic_tol: float = 0.12
+    swing_lookback: int = 60
+    # risk control
+    dd_breaker: float = 0.06
+    dd_resume: float = 0.04
+    loss_risk_decay: float = 0.65
+    # MTF
+    mtf_enable: bool = True
+    mtf_tf: str = "4h"
+    mtf_align_bonus: float = 0.7
+    mtf_conflict_penalty: float = 1.0
+    mtf_strict: bool = True            # macro: respect 4H bias strictly
+    # divergence requirement
+    require_div: bool = False
+    div_min: float = 0.4
+
+
+# Per-symbol overrides (tuned for each asset's character)
+MACRO_OVERRIDES: Dict[str, dict] = {
+    "XAUUSD":  {"threshold": 2.1, "er_min": 0.30, "risk_per_trade": 0.014},   # gold trends well
+    "XAGUSD":  {"threshold": 2.4, "er_min": 0.36, "risk_per_trade": 0.011,    # silver noisier
+                "max_consec_loss": 2, "dd_breaker": 0.05},
+    "SPX":     {"threshold": 2.0, "er_min": 0.28, "risk_per_trade": 0.014,    # SPX smoother
+                "sl_atr_min": 1.4, "sl_atr_max": 2.6},
+    "NDX":     {"threshold": 2.2, "er_min": 0.32, "risk_per_trade": 0.013,    # NDX more volatile
+                "sl_atr_min": 1.6, "sl_atr_max": 3.0},
+}
+
+
+def _macro_cfg_for(sym_c: str, base: "MacroConfig") -> "MacroConfig":
+    ov = MACRO_OVERRIDES.get(sym_c)
+    if not ov:
+        return base
+    from dataclasses import replace as _dc_replace
+    valid = {k: v for k, v in ov.items() if hasattr(base, k)}
+    return _dc_replace(base, **valid)
+
+
+# ── YAHOO FINANCE FETCH ─────────────────────────────────────────────────────────
+_YF_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
+_YF_HDR  = {"User-Agent": "Mozilla/5.0 (Ramos360ELITE/11.0)"}
+
+_YF_INTERVAL = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"60m","60m":"60m","1d":"1d"}
+
+
+async def _fetch_yahoo(yf_sym: str, tf: str, start: datetime, end: datetime) -> pd.DataFrame:
+    """
+    Fetch OHLCV from Yahoo Finance. Supports 1h natively; 4h is resampled from 1h.
+    Returns empty DataFrame on failure.
+    """
+    tf_l = tf.lower()
+    want_4h = tf_l in ("4h",)
+    interval = "60m" if want_4h else _YF_INTERVAL.get(tf_l, "60m")
+    p1 = int(start.timestamp()); p2 = int(end.timestamp())
+    params = {"interval": interval, "period1": p1, "period2": p2,
+              "includePrePost": "false", "events": "history"}
+    logger.info(f"[BT-MACRO] {yf_sym} {tf} {start.date()}→{end.date()} (yahoo {interval})")
+    try:
+        async with httpx.AsyncClient(timeout=30, headers=_YF_HDR) as cl:
+            r = await cl.get(f"{_YF_BASE}/{yf_sym}", params=params)
+        if r.status_code != 200:
+            logger.warning(f"[BT-MACRO] {yf_sym} HTTP {r.status_code}")
+            return pd.DataFrame()
+        j = r.json()
+        ch = (j.get("chart") or {}).get("result") or []
+        if not ch:
+            err = (j.get("chart") or {}).get("error")
+            logger.warning(f"[BT-MACRO] {yf_sym} empty result: {err}")
+            return pd.DataFrame()
+        res = ch[0]
+        ts = res.get("timestamp") or []
+        quote = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+        op, hi, lo, cl_, vol = (quote.get("open") or []), (quote.get("high") or []), \
+                                (quote.get("low") or []), (quote.get("close") or []), \
+                                (quote.get("volume") or [])
+        rows = []
+        for i, t in enumerate(ts):
+            try:
+                if op[i] is None or hi[i] is None or lo[i] is None or cl_[i] is None:
+                    continue
+                v = vol[i] if i < len(vol) and vol[i] is not None else 0
+                rows.append([int(t)*1000, float(op[i]), float(hi[i]), float(lo[i]),
+                             float(cl_[i]), float(v)])
+            except Exception:
+                continue
+        if not rows:
+            logger.warning(f"[BT-MACRO] {yf_sym} no usable rows")
+            return pd.DataFrame()
+        df = pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
+        df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        # Resample 1h → 4h if requested
+        if want_4h:
+            d = df.set_index("ts")
+            agg = d.resample("4h", label="left", closed="left").agg(
+                {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+            ).dropna().reset_index()
+            df = agg
+        logger.info(f"[BT-MACRO] {yf_sym} {tf}: {len(df)} candles ✅")
+        return df
+    except Exception as e:
+        logger.warning(f"[BT-MACRO] {yf_sym} fetch error: {e}")
+        return pd.DataFrame()
+
+
+# ── MACRO INDICATORS (extends _build + _add_div) ────────────────────────────────
+def build_macro(df: pd.DataFrame) -> pd.DataFrame:
+    df = _build(df); df = _add_div(df)
+    c = df.close; win = 10
+    change = (c - c.shift(win)).abs()
+    vol = c.diff().abs().rolling(win).sum()
+    df["er"] = (change / vol.replace(0, 1e-10)).clip(0, 1).fillna(0)
+    df["hh20"] = df.high.rolling(20).max()
+    df["ll20"] = df.low.rolling(20).min()
+    df["hh50"] = df.high.rolling(50).max()
+    df["ll50"] = df.low.rolling(50).min()
+    return df.ffill().bfill()
+
+
+# ── CLASSIC PATTERNS (causal, swing-based) ──────────────────────────────────────
+def _classic_pattern(z, i: int, price: float, tol: float = 0.025):
+    """
+    Detect Double Top / Double Bottom / Head & Shoulders (and inverse).
+    Returns dict {dir, name, score, anchor} or None. Uses confirmed zigzag pivots only.
+    """
+    pts = _confirmed(z, i)
+    if len(pts) < 4:
+        return None
+    last = pts[-4:]
+
+    # ── Double Bottom: L-H-L with two lows ~equal, price now > middle H ──
+    if last[-4][2] == "L" and last[-3][2] == "H" and last[-2][2] == "L" and last[-1][2] == "H":
+        L1, H1, L2, H2 = last[-4], last[-3], last[-2], last[-1]
+        if abs(L2[1] - L1[1]) / max(abs(L1[1]), 1e-9) <= tol and price > H2[1]:
+            return {"dir":"LONG","name":"DOUBLE_BOTTOM","score":1.6,"anchor":min(L1[1], L2[1])}
+        # ── Inverse H&S: L-H-L-H with middle L lower (head) ──
+        if L2[1] < L1[1] and H2[1] >= H1[1] * (1 - tol) and price > max(H1[1], H2[1]):
+            return {"dir":"LONG","name":"INV_HEAD_SHOULDERS","score":1.9,"anchor":L2[1]}
+
+    # ── Double Top: H-L-H-L with two highs ~equal, price now < middle L ──
+    if last[-4][2] == "H" and last[-3][2] == "L" and last[-2][2] == "H" and last[-1][2] == "L":
+        H1, L1, H2, L2 = last[-4], last[-3], last[-2], last[-1]
+        if abs(H2[1] - H1[1]) / max(abs(H1[1]), 1e-9) <= tol and price < L2[1]:
+            return {"dir":"SHORT","name":"DOUBLE_TOP","score":1.6,"anchor":max(H1[1], H2[1])}
+        # ── Head & Shoulders: H-L-H-L with middle H higher (head) ──
+        if H2[1] > H1[1] and L2[1] <= L1[1] * (1 + tol) and price < min(L1[1], L2[1]):
+            return {"dir":"SHORT","name":"HEAD_SHOULDERS","score":1.9,"anchor":H2[1]}
+    return None
+
+
+def _swing_extreme(df, i, lookback: int):
+    """Detect if current bar prints fresh swing-extreme (HH or LL) over lookback window."""
+    if i < lookback:
+        return None
+    win_hi = float(df.high.iloc[i-lookback:i].max())
+    win_lo = float(df.low.iloc[i-lookback:i].min())
+    h0 = float(df.high.iloc[i]); l0 = float(df.low.iloc[i])
+    if h0 > win_hi: return "HH"
+    if l0 < win_lo: return "LL"
+    return None
+
+
+# ── MACRO SIGNAL (combines all schools) ─────────────────────────────────────────
+def macro_signal(df, z, i, cfg: MacroConfig, df_mtf=None):
+    price = float(df.close.iloc[i]); row = df.iloc[i]
+    er = float(row.er); adx = float(row.adx); vr = float(row.vr)
+    if er < cfg.er_min and adx < cfg.adx_min:
+        return None
+    if vr < cfg.vol_min:
+        return None
+
+    candidates = []
+
+    # 1) Harmonic patterns
+    harm = harmonic_at(z, i, price, cfg)
+    if harm:
+        candidates.append((harm["dir"], 2.0, harm["X"], "HARM_" + harm["name"]))
+
+    # 2) Classic patterns (Double Top/Bottom, H&S, Inv H&S)
+    clas = _classic_pattern(z, i, price)
+    if clas:
+        candidates.append((clas["dir"], clas["score"], clas["anchor"], "CLASSIC_" + clas["name"]))
+
+    # 3) SMC liquidity sweep + premium/discount
+    sm = smc_at(df, z, i, price)
+    if sm:
+        candidates.append((sm["dir"], 0.6 + sm["score"], sm["sl"], "SMC_SWEEP"))
+
+    # 4) Swing-extreme reversal (highest high / lowest low) + reversal candle hint
+    sx = _swing_extreme(df, i, cfg.swing_lookback)
+    if sx == "HH":
+        candidates.append(("SHORT", 1.4, float(row.high), "EXTREME_HH"))
+    elif sx == "LL":
+        candidates.append(("LONG", 1.4, float(row.low),  "EXTREME_LL"))
+
+    if not candidates:
+        return None
+
+    # Trend context (light gate, not blocker for reversals)
+    e50 = float(row.e50); e200 = float(row.e200); slope = float(row.e200_slope)
+
+    best = None
+    for direction, base_sc, sl_anchor, tag in candidates:
+        # Momentum confluence
+        mom_ok, mom_sc = _momentum_signal(df, i, direction)
+        if not mom_ok:
+            continue
+        # Candle / structure
+        st_ok, st_sc = _structure_signal(df, i, direction)
+        if not st_ok and not tag.startswith(("HARM", "CLASSIC")):
+            continue
+
+        # RSI/OBV divergence bonus (your "golden ratio" momentum confirmation)
+        dv = float(row.div_sc)
+        div_bonus = (dv * 0.6) if (direction == "LONG" and dv > 0) else \
+                    (-dv * 0.6) if (direction == "SHORT" and dv < 0) else 0.0
+        if cfg.require_div:
+            if direction == "LONG" and dv < cfg.div_min:  continue
+            if direction == "SHORT" and dv > -cfg.div_min: continue
+
+        # Trend penalty for fighting strong macro trend (soft)
+        trend_pen = 0.0
+        if direction == "LONG" and price < e200 and slope < -0.001:  trend_pen = -0.4
+        if direction == "SHORT" and price > e200 and slope > 0.001:  trend_pen = -0.4
+
+        total = base_sc + mom_sc * 0.7 + (st_sc * 0.6 if st_ok else 0.0) + div_bonus + trend_pen
+
+        # MTF gate (strict for macro)
+        mtf_state = "OFF"
+        if cfg.mtf_enable and df_mtf is not None and not df_mtf.empty:
+            bias = _mtf_bias_at(df_mtf, df.ts.iloc[i]); mtf_state = bias
+            aligned  = (direction=="LONG" and bias=="UP") or (direction=="SHORT" and bias=="DOWN")
+            conflict = (direction=="LONG" and bias=="DOWN") or (direction=="SHORT" and bias=="UP")
+            if aligned:
+                total += cfg.mtf_align_bonus
+            elif conflict:
+                if cfg.mtf_strict and not tag.startswith(("HARM", "CLASSIC", "EXTREME")):
+                    # allow only strongest reversal patterns to fight 4H bias
+                    continue
+                total -= cfg.mtf_conflict_penalty
+
+        if total < cfg.threshold:
+            continue
+        cand = {"dir":direction, "score":round(total,3), "sl_anchor":sl_anchor,
+                "tag":tag, "mtf":mtf_state}
+        if best is None or total > best["score"]:
+            best = cand
+    return best
+
+
+def sim_macro(df: pd.DataFrame, cfg: MacroConfig, balance: float = 10_000.0, df_mtf=None) -> Dict:
+    """Macro engine simulator — same skeleton as sim_alt but routes through macro_signal."""
+    n = len(df); start = balance
+    equity = [balance]; trades = []
+    piv_all = zigzag_dev(df, cfg.zz_atr)
+    WARMUP = 80
+    in_trade = False; direction = ""; entry = sl = tp1 = tp2 = tp3 = sl_d = 0.0
+    entry_idx = 0; entry_sess = "—"; pos_frac = 1.0
+    hit_tp1 = hit_tp2 = False; consec_loss = 0; risk_dollars = 0.0
+    peak = balance; halted = False
+    cur_ts = None; entry_ts_cur = None; risk_frac_cur = 0.0
+
+    def close_leg(px, frac, etype, fdir):
+        nonlocal balance, consec_loss
+        raw = ((px - entry) / entry * 100) if fdir == "LONG" else ((entry - px) / entry * 100)
+        raw = _apply_fees(raw, cfg)
+        r_mult = raw / (sl_d / entry * 100) if sl_d > 0 else 0.0
+        gain = risk_dollars * r_mult * frac
+        balance = max(1.0, balance + gain)
+        win = gain > 0
+        if etype in ("SL", "TIME_EXIT", "TRAIL_STOP") and not win:
+            consec_loss += 1
+        elif win:
+            consec_loss = 0
+        trades.append({"direction":fdir,"entry":round(entry,4),"exit":round(px,4),
+                       "pnl_pct":round(raw*frac,4),"r_mult":round(r_mult*frac,3),
+                       "result":"WIN" if win else "LOSS","exit_type":etype,
+                       "session":entry_sess,"frac":round(frac,2),
+                       "risk_frac":round(risk_frac_cur,6),
+                       "entry_ts":(entry_ts_cur.isoformat() if entry_ts_cur is not None else None),
+                       "exit_ts":(cur_ts.isoformat() if cur_ts is not None else None)})
+
+    for i in range(WARMUP, n):
+        row = df.iloc[i]; price = float(row.close); cur_ts = row.ts
+        hi_c = float(row.high); lo_c = float(row.low); op_c = float(row.open)
+        hour = row.ts.hour if hasattr(row.ts, "hour") else 10
+        atr_now = float(row.atr); atr_now = atr_now if atr_now > 0 else price*0.01
+
+        if in_trade:
+            if (i - entry_idx) > cfg.max_hold_bars:
+                close_leg(price, pos_frac, "TIME_EXIT", direction)
+                in_trade = False; equity.append(balance); continue
+            if direction == "LONG":
+                sl_hit = lo_c <= sl; tp1_hit = hi_c >= tp1; tp2_hit = hi_c >= tp2; tp3_hit = hi_c >= tp3
+            else:
+                sl_hit = hi_c >= sl; tp1_hit = lo_c <= tp1; tp2_hit = lo_c <= tp2; tp3_hit = lo_c <= tp3
+            tp_first = False
+            if sl_hit and tp1_hit and not hit_tp1:
+                if direction == "LONG":
+                    d_tp = abs(tp1 - op_c); d_sl = abs(op_c - sl)
+                else:
+                    d_tp = abs(op_c - tp1); d_sl = abs(sl - op_c)
+                if d_sl > 0 and (d_tp / d_sl) < 0.55:
+                    tp_first = True
+            if sl_hit and not tp_first:
+                etype = "SL" if not hit_tp1 else ("BE_STOP" if not hit_tp2 else "TRAIL_STOP")
+                close_leg(sl, pos_frac, etype, direction); in_trade = False; equity.append(balance); continue
+            if tp1_hit and not hit_tp1:
+                close_leg(tp1, cfg.tp1_frac, "TP1", direction); pos_frac -= cfg.tp1_frac; hit_tp1 = True
+                be = entry*(1 + (cfg.fee_rate+cfg.slippage)*2) if direction == "LONG" else entry*(1 - (cfg.fee_rate+cfg.slippage)*2)
+                sl = be
+                if direction == "LONG" and lo_c <= sl and not tp2_hit:
+                    close_leg(sl, pos_frac, "BE_STOP", direction); in_trade = False; equity.append(balance); continue
+                if direction == "SHORT" and hi_c >= sl and not tp2_hit:
+                    close_leg(sl, pos_frac, "BE_STOP", direction); in_trade = False; equity.append(balance); continue
+            if tp2_hit and hit_tp1 and not hit_tp2:
+                close_leg(tp2, cfg.tp2_frac, "TP2", direction); pos_frac -= cfg.tp2_frac; hit_tp2 = True
+            if tp3_hit and hit_tp2:
+                close_leg(tp3, pos_frac, "TP3", direction); in_trade = False; pos_frac = 0.0; equity.append(balance); continue
+            if hit_tp2 and pos_frac > 0:
+                if direction == "LONG":
+                    nt = round(hi_c - atr_now*cfg.chandelier_atr, 6)
+                    if nt > sl: sl = nt
+                else:
+                    nt = round(lo_c + atr_now*cfg.chandelier_atr, 6)
+                    if nt < sl: sl = nt
+            equity.append(balance); continue
+
+        peak = max(peak, balance)
+        dd = (peak - balance) / peak if peak > 0 else 0.0
+        if not halted and dd >= cfg.dd_breaker: halted = True
+        if halted:
+            if dd <= cfg.dd_resume: halted = False
+            else: equity.append(balance); continue
+
+        if not _sess_ok(hour, cfg):
+            equity.append(balance); continue
+        if consec_loss >= cfg.max_consec_loss:
+            consec_loss = 0; equity.append(balance); continue
+
+        z = _confirmed(piv_all, i)
+        sig = macro_signal(df, z, i, cfg, df_mtf=df_mtf)
+        if not sig:
+            equity.append(balance); continue
+        out = alt_sl_tp(price, sig["dir"], sig["sl_anchor"], atr_now, cfg, df, i)
+        if not out:
+            equity.append(balance); continue
+        sl_p, sl_dist, tp1_p, tp2_p, tp3_p = out
+        rr = abs(tp1_p - price) / max(sl_dist, 1e-10)
+        if rr < cfg.min_rr:
+            equity.append(balance); continue
+
+        direction = sig["dir"]; entry = price; sl = sl_p; sl_d = sl_dist
+        tp1, tp2, tp3 = tp1_p, tp2_p, tp3_p
+        entry_sess = _sess(hour); entry_idx = i; entry_ts_cur = row.ts
+        in_trade = True; pos_frac = 1.0; hit_tp1 = hit_tp2 = False
+        conf = min(1.3, max(0.6, sig["score"] / cfg.threshold))
+        decay = cfg.loss_risk_decay ** consec_loss
+        risk_frac_cur = min(cfg.risk_cap, cfg.risk_per_trade * conf * decay)
+        risk_dollars = balance * risk_frac_cur
+        equity.append(balance)
+
+    if in_trade:
+        close_leg(float(df.close.iloc[-1]), pos_frac, "OPEN_AT_END", direction)
+    return {"trades": trades, "equity": equity, "final_balance": balance, "start_balance": start}
+
+
 # ══════════════════════════════════════════════════════════════════
 # UNIFIED COMPOUNDING PORTFOLIO (نموذج محفظة موحّدة مركّبة)
 # ──────────────────────────────────────────────────────────────────
@@ -1239,16 +1671,34 @@ def simulate_portfolio(results: Dict, initial: float = 10_000.0,
 # ══════════════════════════════════════════════════════════════════
 class BacktestEngine:
     def __init__(self, cfg: Optional[BTConfig] = None, alt_cfg: Optional[AltConfig] = None,
-                 alt_enable: bool = True):
+                 macro_cfg: Optional[MacroConfig] = None,
+                 alt_enable: bool = True, macro_enable: bool = True):
         self.cfg = cfg or BTConfig()
-        self.alt_cfg = alt_cfg or AltConfig()   # dedicated XRP/SOL/LINK engine
+        self.alt_cfg = alt_cfg or AltConfig()       # XRP/SOL/LINK/...
+        self.macro_cfg = macro_cfg or MacroConfig() # XAU/XAG/SPX/NDX (futures)
         self.alt_enable = alt_enable
+        self.macro_enable = macro_enable
 
     @staticmethod
     def _normalize_symbol(s: str) -> str:
-        """Accept BTC | BTCUSDT | BTC/USDT | BTC-USDT | BTC/USDT:USDT → BTC/USDT:USDT."""
+        """
+        Accept crypto and macro symbols.
+        Crypto:  BTC | BTCUSDT | BTC/USDT | BTC-USDT | BTC/USDT:USDT → BTC/USDT:USDT
+        Macro :  XAUUSD | XAU/USD | GOLD | SPX | ES | NDX | NASDAQ | NQ → canonical macro key
+        """
         if not s: return ""
         x = s.strip().upper().replace("-", "/")
+        # ── Macro detection ──
+        bare = x.split(":")[0].replace("/", "")
+        macro_alias = {
+            "XAUUSD":"XAUUSD","GOLD":"XAUUSD","XAU":"XAUUSD",
+            "XAGUSD":"XAGUSD","SILVER":"XAGUSD","XAG":"XAGUSD",
+            "SPX":"SPX","ES":"SPX","SP500":"SPX","SPX500":"SPX",
+            "NDX":"NDX","NASDAQ":"NDX","NQ":"NDX","NAS100":"NDX","NDX100":"NDX",
+        }
+        if bare in macro_alias:
+            return macro_alias[bare]
+        # ── Crypto normalization ──
         if ":" in x: return x
         if "/" in x:
             base, _, _quote = x.partition("/")
@@ -1262,12 +1712,16 @@ class BacktestEngine:
                   balance: float = 10_000.0, force_eth: bool = True,
                   force_xrp: bool = True, force_sol: bool = True,
                   force_link: bool = True, force_doge: bool = True,
-                  force_avax: bool = True, force_near: bool = True, **kwargs) -> Dict:
+                  force_avax: bool = True, force_near: bool = True,
+                  force_xauusd: bool = True, force_xagusd: bool = True,
+                  force_spx: bool = True, force_nasdaq: bool = True,
+                  **kwargs) -> Dict:
         resolved = tf or timeframe or "1h"
 
         # ── Symbol normalization + auto-add guarantee ──
         raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT",
-                          "LINK/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "NEAR/USDT:USDT"]
+                          "LINK/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "NEAR/USDT:USDT",
+                          "XAUUSD", "XAGUSD", "SPX", "NDX"]
         symbols = []
         seen = set()
         for s in raw:
@@ -1275,13 +1729,17 @@ class BacktestEngine:
             if n and n not in seen:
                 symbols.append(n); seen.add(n)
         _forced = [
-            (force_eth,  "ETH/USDT:USDT"),
-            (force_xrp,  "XRP/USDT:USDT"),
-            (force_sol,  "SOL/USDT:USDT"),
-            (force_link, "LINK/USDT:USDT"),
-            (force_doge, "DOGE/USDT:USDT"),
-            (force_avax, "AVAX/USDT:USDT"),
-            (force_near, "NEAR/USDT:USDT"),
+            (force_eth,     "ETH/USDT:USDT"),
+            (force_xrp,     "XRP/USDT:USDT"),
+            (force_sol,     "SOL/USDT:USDT"),
+            (force_link,    "LINK/USDT:USDT"),
+            (force_doge,    "DOGE/USDT:USDT"),
+            (force_avax,    "AVAX/USDT:USDT"),
+            (force_near,    "NEAR/USDT:USDT"),
+            (force_xauusd,  "XAUUSD"),
+            (force_xagusd,  "XAGUSD"),
+            (force_spx,     "SPX"),
+            (force_nasdaq,  "NDX"),
         ]
         for flag, inst in _forced:
             if flag and inst not in seen:
@@ -1289,31 +1747,45 @@ class BacktestEngine:
                 logger.info(f"[BT] force → {inst} auto-added")
         logger.info(f"[BT] symbols to test: {symbols}")
 
-
         sdt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
         edt = datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
         results = {}
         for sym in symbols:
-            sym_c = sym.replace("/USDT:USDT", "")
+            is_macro = self.macro_enable and sym in MACRO_SYMBOLS
+            sym_c = sym if is_macro else sym.replace("/USDT:USDT", "")
             try:
-                df = await _fetch(sym, resolved, sdt, edt)
+                # ── Fetch primary timeframe (Yahoo for macro, OKX for crypto) ──
+                if is_macro:
+                    yf_sym = MACRO_YF_MAP.get(sym, sym)
+                    df = await _fetch_yahoo(yf_sym, resolved, sdt, edt)
+                else:
+                    df = await _fetch(sym, resolved, sdt, edt)
                 if df is None or len(df) < 80:
                     msg = f"insufficient data ({0 if df is None else len(df)} candles)"
                     logger.error(f"[BT] {sym_c}: {msg}")
                     results[sym_c] = {"error": msg, "symbol": sym_c, "tf": resolved,
                                        "period": f"{start}→{end}"}
                     continue
-                is_alt = self.alt_enable and sym_c in ALT_SYMBOLS
-                if is_alt:
+
+                is_alt = (not is_macro) and self.alt_enable and sym_c in ALT_SYMBOLS
+                if is_macro:
+                    df = build_macro(df)
+                elif is_alt:
                     df = build_alt(df)
                 else:
                     df = _build(df); df = _add_div(df)
 
                 # ── MTF fetch (4H by default) ──
                 df_mtf = pd.DataFrame()
-                if self.cfg.mtf_enable and self.cfg.mtf_tf.lower() != resolved.lower():
+                mtf_tf = self.macro_cfg.mtf_tf if is_macro else self.cfg.mtf_tf
+                mtf_on = (self.macro_cfg.mtf_enable if is_macro else self.cfg.mtf_enable)
+                if mtf_on and mtf_tf.lower() != resolved.lower():
                     try:
-                        raw_mtf = await _fetch(sym, self.cfg.mtf_tf, sdt, edt)
+                        if is_macro:
+                            yf_sym = MACRO_YF_MAP.get(sym, sym)
+                            raw_mtf = await _fetch_yahoo(yf_sym, mtf_tf, sdt, edt)
+                        else:
+                            raw_mtf = await _fetch(sym, mtf_tf, sdt, edt)
                         df_mtf = _build_mtf(raw_mtf)
                         if df_mtf.empty:
                             logger.warning(f"[BT] {sym_c}: MTF data unavailable, fallback OFF")
@@ -1321,19 +1793,27 @@ class BacktestEngine:
                         logger.warning(f"[BT] {sym_c}: MTF fetch failed ({e}), fallback OFF")
                         df_mtf = pd.DataFrame()
 
-                if is_alt:
-                    eff_cfg = _alt_cfg_for(sym_c, self.alt_cfg)   # عزل/تصفية لكل عملة (XRP أصرم)
+                # ── Dispatch to the right engine ──
+                if is_macro:
+                    eff_cfg = _macro_cfg_for(sym_c, self.macro_cfg)
+                    sim = sim_macro(df, eff_cfg, balance, df_mtf=df_mtf)
+                    engine_tag = "MACRO-Q v11"
+                elif is_alt:
+                    eff_cfg = _alt_cfg_for(sym_c, self.alt_cfg)
                     sim = sim_alt(df, eff_cfg, balance, df_mtf=df_mtf)
                     engine_tag = "ALT-Q v10"
                 else:
                     sim = _sim(df, self.cfg, balance, df_mtf=df_mtf)
                     engine_tag = "ELITE v8"
+
                 st = _metrics(sim, balance)
-                results[sym_c] = {**st, "symbol":sym_c, "tf":resolved, "engine":engine_tag,
-                                  "mtf": self.cfg.mtf_tf if (self.cfg.mtf_enable and not df_mtf.empty) else "—",
+                display = MACRO_DISPLAY.get(sym_c, sym_c) if is_macro else sym_c
+                results[sym_c] = {**st, "symbol":sym_c, "display":display, "tf":resolved,
+                                  "engine":engine_tag,
+                                  "mtf": mtf_tf if (mtf_on and not df_mtf.empty) else "—",
                                   "period":f"{start}→{end}", "candles":len(df),
                                   "_trades": sim.get("trades", [])}
-                logger.info(f"[BT] {sym_c}: {st.get('total',0)} trades "
+                logger.info(f"[BT] {sym_c} [{engine_tag}]: {st.get('total',0)} trades "
                             f"WR={st.get('win_rate_pct',0)}% Ret={st.get('return_pct',0):+.2f}% "
                             f"PF={st.get('profit_factor',0)}")
             except Exception as e:
@@ -1342,20 +1822,23 @@ class BacktestEngine:
                                    "period": f"{start}→{end}"}
         return results
 
+
     @staticmethod
     def format_report(results: Dict) -> str:
         tf = next((v.get("tf","1H") for v in results.values() if isinstance(v, dict) and "tf" in v), "1H")
         mtf = next((v.get("mtf","—") for v in results.values() if isinstance(v, dict) and "mtf" in v), "—")
         period = next((v.get("period","") for v in results.values() if isinstance(v, dict) and "period" in v), "")
-        lines = ["📈 <b>Backtest — Ramos 360 Ai 🎖️  ELITE v10 (Dual-Engine + Unified Portfolio)</b>",
+        lines = ["📈 <b>Backtest — Ramos 360 Ai 🎖️  ELITE v11 (Tri-Engine: Crypto + Alts + Macro)</b>",
                  f"📅 Period: {period}",
-                 f"⏱️ Timeframe: {tf.upper()} | HTF Bias: {mtf.upper()} | Trend-Pullback + Multi-Target",
+                 f"⏱️ Timeframe: {tf.upper()} | HTF Bias: {mtf.upper()} | Multi-School Confluence",
                  "✅ Causal (no look-ahead) + Fees/Slippage + Scaled TP1/TP2/TP3 + MTF Filter",
+                 "🎯 Engines: ELITE v8 (BTC/ETH) · ALT-Q v10 (XRP/SOL/LINK/…) · MACRO-Q v11 (XAU/XAG/SPX/NDX)",
                  "━━━━━━━━━━━━━━━━━━━━━━━━"]
         agg = {"total":0,"wins":0,"losses":0,"ret":0.0,"tp1":0,"tp2":0,"tp3":0,"sl":0}
         for sym, r in results.items():
+            disp = r.get("display", sym) if isinstance(r, dict) else sym
             if "error" in r:
-                lines.append(f"❌ {sym}: {r['error']}"); continue
+                lines.append(f"❌ {disp}: {r['error']}"); continue
             ei = "🟢" if r.get("return_pct", 0) > 0 else "🔴"
             ex = " ".join(f"{k}:{v}" for k, v in r.get("exit_breakdown", {}).items())
             ss = " ".join(f"{k}:{v}" for k, v in r.get("session_breakdown", {}).items())
@@ -1364,7 +1847,7 @@ class BacktestEngine:
             agg["ret"] += r.get("return_pct",0)
             agg["tp1"] += tph.get("TP1",0); agg["tp2"] += tph.get("TP2",0); agg["tp3"] += tph.get("TP3",0)
             agg["sl"]  += r.get("exit_breakdown",{}).get("SL",0)
-            lines += ["", f"{ei} <b>{sym}</b>",
+            lines += ["", f"{ei} <b>{disp}</b>  · <i>{r.get('engine','—')}</i>",
                       f"  📊 {r['total']} trades  ({r.get('wins',0)}W/{r.get('losses',0)}L)",
                       f"  🎯 Win Rate:   {r['win_rate_pct']:.1f}%",
                       f"  💰 Return:     {r.get('return_pct',0):+.2f}%",
@@ -1387,7 +1870,7 @@ class BacktestEngine:
                       f"  💰 Avg Return:   {agg['ret']/max(1,len([r for r in results.values() if 'error' not in r])):+.2f}%",
                       f"  🏁 Targets:      TP1:{agg['tp1']} TP2:{agg['tp2']} TP3:{agg['tp3']}  |  SL:{agg['sl']}"]
 
-        # ── Unified Compounding Portfolio (محفظة موحّدة مركّبة) ──
+        # ── Unified Compounding Portfolio ──
         port = simulate_portfolio(results, initial=10_000.0)
         if "error" not in port:
             pei = "🟢" if port["return_pct"] > 0 else "🔴"
@@ -1399,14 +1882,15 @@ class BacktestEngine:
                       f"  ⚖️ Sharpe:       {port['sharpe']:.3f}",
                       f"  📊 Trade Legs:   {port['total_legs']}  ({port['win_legs']}W/{port['loss_legs']}L)",
                       f"  🎯 Win Rate:     {port['win_rate_pct']:.1f}%"]
-        lines += ["━━━━━━━━━━━━━━━━━━━━━━━━", "<i>🎖️ Ramos 360 Ai — ELITE v10 (Dual-Engine + Portfolio)</i>"]
+        lines += ["━━━━━━━━━━━━━━━━━━━━━━━━", "<i>🎖️ Ramos 360 Ai — ELITE v11 (Tri-Engine + Portfolio)</i>"]
         return "\n".join(lines)
 
 
 async def _main():
     e = BacktestEngine()
-    r = await e.run(symbols=["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT",
-                             "LINK/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "NEAR/USDT:USDT"],
+    r = await e.run(symbols=["BTC/USDT:USDT","ETH/USDT:USDT","XRP/USDT:USDT","SOL/USDT:USDT",
+                             "LINK/USDT:USDT","DOGE/USDT:USDT","AVAX/USDT:USDT","NEAR/USDT:USDT",
+                             "XAUUSD","XAGUSD","SPX","NDX"],
                     timeframe="1h", start="2026-01-01", end="2026-05-01", balance=10_000.0)
     print("\n" + e.format_report(r).replace("<b>","").replace("</b>","")
           .replace("<i>","").replace("</i>",""))
@@ -1414,3 +1898,4 @@ async def _main():
 
 if __name__ == "__main__":
     asyncio.run(_main())
+
