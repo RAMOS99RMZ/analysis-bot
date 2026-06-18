@@ -743,12 +743,402 @@ def _metrics(sim: Dict, initial: float) -> Dict:
             "tp_hits":tp_hits,"exit_breakdown":by_ex,"session_breakdown":by_ss}
 
 
+# ══════════════════════════════════════════════════════════════════════════════════
+# ████ ALTCOIN QUANT ENGINE — Ramos 360 Ai 🎖️  ELITE v9  (XRP / SOL / LINK) ████
+# ──────────────────────────────────────────────────────────────────────────────────
+# Dedicated reversal/confluence engine for alts. BTC/ETH keep the v8 trend-pullback
+# engine untouched. Schools combined here (causal, no look-ahead):
+#   • Harmonic patterns  : Gartley / Bat / Butterfly / Crab / Shark (PRZ completion at D)
+#   • SMC               : liquidity sweep + premium/discount + structure
+#   • Classic + Candles : engulfing / hammer / stars / pin-bars (reused _structure_signal)
+#   • Momentum          : RSI / MACD-hist / OBV / Stoch (reused _momentum_signal) + RSI divergence
+#   • MTF 4H bias gate (STRICT for alts) + Kaufman Efficiency-Ratio noise filter
+#   • Risk: adaptive sizing by confidence, loss-decay, equity circuit-breaker
+# Empirically the best of {HARMONIC, SMC, MR, CONFLUENCE} variants → CONFLUENCE (strict).
+# ══════════════════════════════════════════════════════════════════════════════════
+
+ALT_SYMBOLS = {"XRP", "SOL", "LINK"}
+
+_HARM = {
+    "GARTLEY":   {"AB": (0.55, 0.66), "BC": (0.382, 0.886), "CD": (1.13, 1.618), "AD": (0.74, 0.83)},
+    "BAT":       {"AB": (0.382, 0.55), "BC": (0.382, 0.886), "CD": (1.5, 2.8),   "AD": (0.85, 0.92)},
+    "BUTTERFLY": {"AB": (0.74, 0.83),  "BC": (0.382, 0.886), "CD": (1.5, 2.4),   "AD": (1.2, 1.7)},
+    "CRAB":      {"AB": (0.382, 0.618),"BC": (0.382, 0.886), "CD": (2.0, 3.8),   "AD": (1.5, 1.8)},
+    "SHARK":     {"AB": (0.382, 0.7),  "BC": (1.13, 1.7),    "CD": (1.27, 2.24), "AD": (0.85, 1.2)},
+}
+
+
+@dataclass
+class AltConfig:
+    """Tuned defaults = empirically-best CONFLUENCE(strict) variant."""
+    strat: str = "CONFLUENCE"          # CONFLUENCE | HARMONIC | SMC | MR | TREND
+    risk_per_trade: float = 0.012
+    fee_rate: float = 0.0005
+    slippage: float = 0.0003
+    # targets (R multiples)
+    tp1_r: float = 1.2
+    tp2_r: float = 2.0
+    tp3_r: float = 3.2
+    tp1_frac: float = 0.5
+    tp2_frac: float = 0.3
+    # stop
+    sl_atr_min: float = 1.6
+    sl_atr_max: float = 3.2
+    sl_buffer_atr: float = 0.25
+    chandelier_atr: float = 2.6
+    # gating
+    min_rr: float = 1.1
+    max_hold_bars: int = 54
+    max_consec_loss: int = 2
+    allow_asia: bool = True
+    # quality gates
+    er_min: float = 0.36               # Kaufman efficiency ratio (trend purity)
+    adx_min: float = 14.0
+    vol_min: float = 0.7
+    threshold: float = 2.0             # confluence score gate
+    # zigzag
+    zz_atr: float = 2.2
+    harmonic_tol: float = 0.12
+    # risk control
+    dd_breaker: float = 0.07
+    dd_resume: float = 0.05
+    loss_risk_decay: float = 0.6
+    # MTF
+    mtf_enable: bool = True
+    mtf_tf: str = "4h"
+    mtf_align_bonus: float = 0.6
+    mtf_conflict_penalty: float = 1.2
+    mtf_strict: bool = True            # alts: never fight 4H bias
+    # optional legs
+    trend_block: bool = False
+    use_trend: bool = False
+    require_div: bool = False
+    div_min: float = 0.5
+
+
+_BTCFG = BTConfig()   # proven BTC/ETH trend-pullback signal (used only if use_trend=True)
+
+
+# ── extra indicators (causal) ──────────────────────────────────────────────────────
+def build_alt(df: pd.DataFrame) -> pd.DataFrame:
+    df = _build(df); df = _add_div(df)
+    c = df.close; win = 10
+    change = (c - c.shift(win)).abs()
+    vol = c.diff().abs().rolling(win).sum()
+    df["er"] = (change / vol.replace(0, 1e-10)).clip(0, 1).fillna(0)
+    df["hh20"] = df.high.rolling(20).max()
+    df["ll20"] = df.low.rolling(20).min()
+    return df.ffill().bfill()
+
+
+def zigzag_dev(df: pd.DataFrame, atr_mult: float = 2.2) -> List[Tuple[int, float, str, int]]:
+    """ATR-deviation ZigZag → alternating swings (idx, price, 'H'/'L', confirm_idx). Causal."""
+    highs = df.high.values; lows = df.low.values; atr = df.atr.values
+    n = len(df)
+    if n < 5:
+        return []
+    piv: List[Tuple[int, float, str, int]] = []
+    direction = 1; ext_idx = 0; ext_price = float(highs[0])
+    for i in range(1, n):
+        thr = float(atr[i]) * atr_mult if atr[i] > 0 else float(highs[i]) * 0.01
+        if direction == 1:
+            if highs[i] >= ext_price:
+                ext_price = float(highs[i]); ext_idx = i
+            elif ext_price - lows[i] >= thr:
+                piv.append((ext_idx, ext_price, "H", i))
+                direction = -1; ext_price = float(lows[i]); ext_idx = i
+        else:
+            if lows[i] <= ext_price:
+                ext_price = float(lows[i]); ext_idx = i
+            elif highs[i] - ext_price >= thr:
+                piv.append((ext_idx, ext_price, "L", i))
+                direction = 1; ext_price = float(highs[i]); ext_idx = i
+    return piv
+
+
+def _confirmed(piv, i: int) -> List[Tuple[int, float, str]]:
+    return [(p[0], p[1], p[2]) for p in piv if p[3] <= i]
+
+
+def _ratio(a, b):
+    return abs(a) / abs(b) if abs(b) > 1e-12 else 0.0
+
+
+def harmonic_at(z, i: int, price: float, cfg: AltConfig):
+    """XABC with D forming at live price → harmonic PRZ entry (causal)."""
+    if len(z) < 4:
+        return None
+    X, A, Bp, C = z[-4], z[-3], z[-2], z[-1]
+    types = [X[2], A[2], Bp[2], C[2]]
+    if types == ["L", "H", "L", "H"]:
+        bull = True
+    elif types == ["H", "L", "H", "L"]:
+        bull = False
+    else:
+        return None
+    XA = A[1] - X[1]; AB = Bp[1] - A[1]; BC = C[1] - Bp[1]
+    CD = price - C[1]; AD = price - X[1]
+    if abs(XA) < 1e-9 or abs(AB) < 1e-9 or abs(BC) < 1e-9:
+        return None
+    if bull and not (price < C[1]):
+        return None
+    if (not bull) and not (price > C[1]):
+        return None
+    rAB = _ratio(AB, XA); rBC = _ratio(BC, AB); rCD = _ratio(CD, BC); rAD = _ratio(AD, XA)
+    tol = cfg.harmonic_tol
+    for name, r in _HARM.items():
+        def ok(v, rng):
+            return (rng[0] * (1 - tol)) <= v <= (rng[1] * (1 + tol))
+        if ok(rAB, r["AB"]) and ok(rBC, r["BC"]) and ok(rCD, r["CD"]) and ok(rAD, r["AD"]):
+            return {"name": name, "dir": "LONG" if bull else "SHORT", "X": X[1], "score": 1.0}
+    return None
+
+
+def smc_at(df: pd.DataFrame, z, i: int, price: float):
+    """Liquidity sweep + premium/discount reversal."""
+    if len(z) < 4 or i < 5:
+        return None
+    r0 = df.iloc[i]
+    l0 = float(r0.low); h0 = float(r0.high); c0 = float(r0.close)
+    last_high = next((p for p in reversed(z) if p[2] == "H"), None)
+    last_low = next((p for p in reversed(z) if p[2] == "L"), None)
+    if not last_high or not last_low:
+        return None
+    rng = last_high[1] - last_low[1]
+    if rng <= 0:
+        return None
+    disc = (price - last_low[1]) / rng
+    if l0 < last_low[1] and c0 > last_low[1] and disc < 0.5:
+        return {"dir": "LONG", "score": round(1.0 + (0.5 - disc), 3), "sl": l0}
+    if h0 > last_high[1] and c0 < last_high[1] and disc > 0.5:
+        return {"dir": "SHORT", "score": round(1.0 + (disc - 0.5), 3), "sl": h0}
+    return None
+
+
+def _mr_zone(df, i, price, direction):
+    row = df.iloc[i]; bbl = float(row.bbl); bbu = float(row.bbu)
+    return price <= bbl * 1.003 if direction == "LONG" else price >= bbu * 0.997
+
+
+def alt_signal(df, z, i, cfg: AltConfig, df_mtf=None):
+    price = float(df.close.iloc[i]); row = df.iloc[i]
+    er = float(row.er); adx = float(row.adx); vr = float(row.vr)
+    if er < cfg.er_min and adx < cfg.adx_min:
+        return None
+    if vr < cfg.vol_min:
+        return None
+
+    candidates = []
+    harm = harmonic_at(z, i, price, cfg)
+    smc = smc_at(df, z, i, price)
+    if cfg.strat in ("HARMONIC", "CONFLUENCE") and harm:
+        candidates.append((harm["dir"], 2.0, harm["X"], "HARM_" + harm["name"]))
+    if cfg.strat in ("SMC", "CONFLUENCE") and smc:
+        candidates.append((smc["dir"], 0.5 + smc["score"], smc["sl"], "SMC_SWEEP"))
+    if cfg.strat in ("MR", "CONFLUENCE"):
+        for d in ("LONG", "SHORT"):
+            if _mr_zone(df, i, price, d):
+                candidates.append((d, 1.2, None, "MR_BB"))
+    if cfg.use_trend and cfg.strat in ("TREND", "CONFLUENCE"):
+        lb = 50
+        hi_sw = float(df.high.iloc[max(0, i - lb):i + 1].max())
+        lo_sw = float(df.low.iloc[max(0, i - lb):i + 1].min())
+        tdir, _tsc, _td = _elite_signal(df, i, hi_sw, lo_sw, _BTCFG, df_mtf=df_mtf)
+        if tdir in ("LONG", "SHORT"):
+            candidates.append((tdir, 1.9, None, "TREND_PB"))
+    if not candidates:
+        return None
+
+    e50 = float(row.e50); e200 = float(row.e200); slope = float(row.e200_slope)
+    strong_down = price < e200 and e50 < e200 and slope < -0.0008
+    strong_up = price > e200 and e50 > e200 and slope > 0.0008
+
+    best = None
+    for direction, base_sc, sl_anchor, tag in candidates:
+        if cfg.trend_block:
+            if direction == "LONG" and strong_down:
+                continue
+            if direction == "SHORT" and strong_up:
+                continue
+        if cfg.require_div and tag != "TREND_PB":
+            dv = float(row.div_sc)
+            if direction == "LONG" and dv < cfg.div_min:
+                continue
+            if direction == "SHORT" and dv > -cfg.div_min:
+                continue
+        mom_ok, mom_sc = _momentum_signal(df, i, direction)
+        if not mom_ok:
+            continue
+        st_ok, st_sc = _structure_signal(df, i, direction)
+        if not st_ok and not tag.startswith("HARM"):
+            continue
+        div = float(row.div_sc)
+        div_bonus = (div * 0.5) if (direction == "LONG" and div > 0) else \
+                    (-div * 0.5) if (direction == "SHORT" and div < 0) else 0.0
+        total = base_sc + mom_sc * 0.7 + (st_sc * 0.6 if st_ok else 0.0) + div_bonus
+
+        mtf_state = "OFF"
+        if cfg.mtf_enable and df_mtf is not None and not df_mtf.empty:
+            bias = _mtf_bias_at(df_mtf, df.ts.iloc[i]); mtf_state = bias
+            aligned = (direction == "LONG" and bias == "UP") or (direction == "SHORT" and bias == "DOWN")
+            conflict = (direction == "LONG" and bias == "DOWN") or (direction == "SHORT" and bias == "UP")
+            if aligned:
+                total += cfg.mtf_align_bonus
+            elif conflict:
+                if cfg.mtf_strict:
+                    continue
+                total -= cfg.mtf_conflict_penalty
+
+        if total < cfg.threshold:
+            continue
+        cand = {"dir": direction, "score": round(total, 3), "sl_anchor": sl_anchor,
+                "tag": tag, "mtf": mtf_state}
+        if best is None or total > best["score"]:
+            best = cand
+    return best
+
+
+def alt_sl_tp(price, direction, sl_anchor, atr, cfg: AltConfig, df, i):
+    buf = atr * cfg.sl_buffer_atr
+    if direction == "LONG":
+        sl = (sl_anchor - buf) if (sl_anchor is not None and sl_anchor < price) else (float(df.slo14.iloc[i]) - buf)
+        sl = min(sl, price - atr * cfg.sl_atr_min); sl = max(sl, price - atr * cfg.sl_atr_max)
+        sl_d = price - sl
+    else:
+        sl = (sl_anchor + buf) if (sl_anchor is not None and sl_anchor > price) else (float(df.shi14.iloc[i]) + buf)
+        sl = max(sl, price + atr * cfg.sl_atr_min); sl = min(sl, price + atr * cfg.sl_atr_max)
+        sl_d = sl - price
+    if sl_d <= 0:
+        return None
+    if direction == "LONG":
+        tp1 = price + sl_d * cfg.tp1_r; tp2 = price + sl_d * cfg.tp2_r; tp3 = price + sl_d * cfg.tp3_r
+    else:
+        tp1 = price - sl_d * cfg.tp1_r; tp2 = price - sl_d * cfg.tp2_r; tp3 = price - sl_d * cfg.tp3_r
+    return round(sl, 6), round(sl_d, 8), round(tp1, 6), round(tp2, 6), round(tp3, 6)
+
+
+def sim_alt(df: pd.DataFrame, cfg: AltConfig, balance: float = 10_000.0, df_mtf=None) -> Dict:
+    n = len(df); start = balance
+    equity = [balance]; trades = []
+    piv_all = zigzag_dev(df, cfg.zz_atr)
+    WARMUP = 80
+    in_trade = False; direction = ""; entry = sl = tp1 = tp2 = tp3 = sl_d = 0.0
+    entry_idx = 0; entry_sess = "—"; pos_frac = 1.0
+    hit_tp1 = hit_tp2 = False; consec_loss = 0; risk_dollars = 0.0
+    peak = balance; halted = False
+
+    def close_leg(px, frac, etype, fdir):
+        nonlocal balance, consec_loss
+        raw = ((px - entry) / entry * 100) if fdir == "LONG" else ((entry - px) / entry * 100)
+        raw = _apply_fees(raw, cfg)
+        r_mult = raw / (sl_d / entry * 100) if sl_d > 0 else 0.0
+        gain = risk_dollars * r_mult * frac
+        balance = max(1.0, balance + gain)
+        win = gain > 0
+        if etype in ("SL", "TIME_EXIT", "TRAIL_STOP") and not win:
+            consec_loss += 1
+        elif win:
+            consec_loss = 0
+        trades.append({"direction": fdir, "entry": round(entry, 6), "exit": round(px, 6),
+                       "pnl_pct": round(raw * frac, 4), "r_mult": round(r_mult * frac, 3),
+                       "result": "WIN" if win else "LOSS", "exit_type": etype,
+                       "session": entry_sess, "frac": round(frac, 2)})
+
+    for i in range(WARMUP, n):
+        row = df.iloc[i]; price = float(row.close)
+        hi_c = float(row.high); lo_c = float(row.low); op_c = float(row.open)
+        hour = row.ts.hour if hasattr(row.ts, "hour") else 10
+        atr_now = float(row.atr); atr_now = atr_now if atr_now > 0 else price * 0.01
+
+        if in_trade:
+            if (i - entry_idx) > cfg.max_hold_bars:
+                close_leg(price, pos_frac, "TIME_EXIT", direction); in_trade = False; equity.append(balance); continue
+            if direction == "LONG":
+                sl_hit = lo_c <= sl; tp1_hit = hi_c >= tp1; tp2_hit = hi_c >= tp2; tp3_hit = hi_c >= tp3
+            else:
+                sl_hit = hi_c >= sl; tp1_hit = lo_c <= tp1; tp2_hit = lo_c <= tp2; tp3_hit = lo_c <= tp3
+            tp_first = False
+            if sl_hit and tp1_hit and not hit_tp1:
+                if direction == "LONG":
+                    d_tp = abs(tp1 - op_c); d_sl = abs(op_c - sl)
+                else:
+                    d_tp = abs(op_c - tp1); d_sl = abs(sl - op_c)
+                if d_sl > 0 and (d_tp / d_sl) < 0.55:
+                    tp_first = True
+            if sl_hit and not tp_first:
+                etype = "SL" if not hit_tp1 else ("BE_STOP" if not hit_tp2 else "TRAIL_STOP")
+                close_leg(sl, pos_frac, etype, direction); in_trade = False; equity.append(balance); continue
+            if tp1_hit and not hit_tp1:
+                close_leg(tp1, cfg.tp1_frac, "TP1", direction); pos_frac -= cfg.tp1_frac; hit_tp1 = True
+                be = entry * (1 + (cfg.fee_rate + cfg.slippage) * 2) if direction == "LONG" else entry * (1 - (cfg.fee_rate + cfg.slippage) * 2)
+                sl = be
+                if direction == "LONG" and lo_c <= sl and not tp2_hit:
+                    close_leg(sl, pos_frac, "BE_STOP", direction); in_trade = False; equity.append(balance); continue
+                if direction == "SHORT" and hi_c >= sl and not tp2_hit:
+                    close_leg(sl, pos_frac, "BE_STOP", direction); in_trade = False; equity.append(balance); continue
+            if tp2_hit and hit_tp1 and not hit_tp2:
+                close_leg(tp2, cfg.tp2_frac, "TP2", direction); pos_frac -= cfg.tp2_frac; hit_tp2 = True
+            if tp3_hit and hit_tp2:
+                close_leg(tp3, pos_frac, "TP3", direction); in_trade = False; pos_frac = 0.0; equity.append(balance); continue
+            if hit_tp2 and pos_frac > 0:
+                if direction == "LONG":
+                    nt = round(hi_c - atr_now * cfg.chandelier_atr, 6)
+                    if nt > sl: sl = nt
+                else:
+                    nt = round(lo_c + atr_now * cfg.chandelier_atr, 6)
+                    if nt < sl: sl = nt
+            equity.append(balance); continue
+
+        peak = max(peak, balance)
+        dd = (peak - balance) / peak if peak > 0 else 0.0
+        if not halted and dd >= cfg.dd_breaker:
+            halted = True
+        if halted:
+            if dd <= cfg.dd_resume:
+                halted = False
+            else:
+                equity.append(balance); continue
+
+        if not _sess_ok(hour, cfg):
+            equity.append(balance); continue
+        if consec_loss >= cfg.max_consec_loss:
+            consec_loss = 0; equity.append(balance); continue
+
+        z = _confirmed(piv_all, i)
+        sig = alt_signal(df, z, i, cfg, df_mtf=df_mtf)
+        if not sig:
+            equity.append(balance); continue
+        out = alt_sl_tp(price, sig["dir"], sig["sl_anchor"], atr_now, cfg, df, i)
+        if not out:
+            equity.append(balance); continue
+        sl_p, sl_dist, tp1_p, tp2_p, tp3_p = out
+        rr = abs(tp1_p - price) / max(sl_dist, 1e-10)
+        if rr < cfg.min_rr:
+            equity.append(balance); continue
+
+        direction = sig["dir"]; entry = price; sl = sl_p; sl_d = sl_dist
+        tp1, tp2, tp3 = tp1_p, tp2_p, tp3_p
+        entry_sess = _sess(hour); entry_idx = i
+        in_trade = True; pos_frac = 1.0; hit_tp1 = hit_tp2 = False
+        conf = min(1.3, max(0.6, sig["score"] / cfg.threshold))
+        decay = cfg.loss_risk_decay ** consec_loss
+        risk_dollars = balance * cfg.risk_per_trade * conf * decay
+        equity.append(balance)
+
+    if in_trade:
+        close_leg(float(df.close.iloc[-1]), pos_frac, "OPEN_AT_END", direction)
+    return {"trades": trades, "equity": equity, "final_balance": balance, "start_balance": start}
+
+
 # ══════════════════════════════════════════════════════════════════
 # BacktestEngine
 # ══════════════════════════════════════════════════════════════════
 class BacktestEngine:
-    def __init__(self, cfg: Optional[BTConfig] = None):
+    def __init__(self, cfg: Optional[BTConfig] = None, alt_cfg: Optional[AltConfig] = None,
+                 alt_enable: bool = True):
         self.cfg = cfg or BTConfig()
+        self.alt_cfg = alt_cfg or AltConfig()   # dedicated XRP/SOL/LINK engine
+        self.alt_enable = alt_enable
 
     @staticmethod
     def _normalize_symbol(s: str) -> str:
@@ -806,7 +1196,11 @@ class BacktestEngine:
                     results[sym_c] = {"error": msg, "symbol": sym_c, "tf": resolved,
                                        "period": f"{start}→{end}"}
                     continue
-                df = _build(df); df = _add_div(df)
+                is_alt = self.alt_enable and sym_c in ALT_SYMBOLS
+                if is_alt:
+                    df = build_alt(df)
+                else:
+                    df = _build(df); df = _add_div(df)
 
                 # ── MTF fetch (4H by default) ──
                 df_mtf = pd.DataFrame()
@@ -820,9 +1214,14 @@ class BacktestEngine:
                         logger.warning(f"[BT] {sym_c}: MTF fetch failed ({e}), fallback OFF")
                         df_mtf = pd.DataFrame()
 
-                sim = _sim(df, self.cfg, balance, df_mtf=df_mtf)
+                if is_alt:
+                    sim = sim_alt(df, self.alt_cfg, balance, df_mtf=df_mtf)
+                    engine_tag = "ALT-Q v9"
+                else:
+                    sim = _sim(df, self.cfg, balance, df_mtf=df_mtf)
+                    engine_tag = "ELITE v8"
                 st = _metrics(sim, balance)
-                results[sym_c] = {**st, "symbol":sym_c, "tf":resolved,
+                results[sym_c] = {**st, "symbol":sym_c, "tf":resolved, "engine":engine_tag,
                                   "mtf": self.cfg.mtf_tf if (self.cfg.mtf_enable and not df_mtf.empty) else "—",
                                   "period":f"{start}→{end}", "candles":len(df)}
                 logger.info(f"[BT] {sym_c}: {st.get('total',0)} trades "
@@ -839,7 +1238,7 @@ class BacktestEngine:
         tf = next((v.get("tf","1H") for v in results.values() if isinstance(v, dict) and "tf" in v), "1H")
         mtf = next((v.get("mtf","—") for v in results.values() if isinstance(v, dict) and "mtf" in v), "—")
         period = next((v.get("period","") for v in results.values() if isinstance(v, dict) and "period" in v), "")
-        lines = ["📈 <b>Backtest — Ramos 360 Ai 🎖️  ELITE v8 (AI Confluence + MTF)</b>",
+        lines = ["📈 <b>Backtest — Ramos 360 Ai 🎖️  ELITE v9 (Dual-Engine: Trend BTC/ETH + Quant Alts)</b>",
                  f"📅 Period: {period}",
                  f"⏱️ Timeframe: {tf.upper()} | HTF Bias: {mtf.upper()} | Trend-Pullback + Multi-Target",
                  "✅ Causal (no look-ahead) + Fees/Slippage + Scaled TP1/TP2/TP3 + MTF Filter",
@@ -878,7 +1277,7 @@ class BacktestEngine:
                       f"  🎯 Win Rate:     {wr_agg:.1f}%",
                       f"  💰 Avg Return:   {agg['ret']/max(1,len([r for r in results.values() if 'error' not in r])):+.2f}%",
                       f"  🏁 Targets:      TP1:{agg['tp1']} TP2:{agg['tp2']} TP3:{agg['tp3']}  |  SL:{agg['sl']}"]
-        lines += ["━━━━━━━━━━━━━━━━━━━━━━━━", "<i>🎖️ Ramos 360 Ai — ELITE v8 (MTF)</i>"]
+        lines += ["━━━━━━━━━━━━━━━━━━━━━━━━", "<i>🎖️ Ramos 360 Ai — ELITE v9 (Dual-Engine)</i>"]
         return "\n".join(lines)
 
 
