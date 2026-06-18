@@ -49,7 +49,8 @@ _TFM  = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1H","4h":"4H","1d":"1
 @dataclass
 class BTConfig:
     # ── Risk & sizing ──
-    risk_per_trade: float = 0.012
+    risk_per_trade: float = 0.018         # ↑ من 0.012 — BTC/ETH عندهما هامش DD مريح
+    risk_cap: float = 0.026               # سقف المخاطرة بعد مكافأة الثقة
     fee_rate: float = 0.0005
     slippage: float = 0.0003
 
@@ -573,6 +574,7 @@ def _sim(df: pd.DataFrame, cfg: BTConfig, balance: float = 10_000.0,
     pos_frac = 1.0
     hit_tp1 = hit_tp2 = False
     consec_loss = 0; risk_dollars = 0.0
+    cur_ts = None; entry_ts_cur = None; risk_frac_cur = 0.0   # ← لنموذج المحفظة الموحّدة
 
     def close_leg(exit_price: float, frac: float, etype: str, force_dir: str):
         nonlocal balance, consec_loss
@@ -589,10 +591,14 @@ def _sim(df: pd.DataFrame, cfg: BTConfig, balance: float = 10_000.0,
         trades.append({"direction":force_dir,"entry":round(entry,4),"exit":round(exit_price,4),
                        "pnl_pct":round(raw*frac,4),"r_mult":round(r_mult*frac,3),
                        "result":"WIN" if win else "LOSS","exit_type":etype,
-                       "session":entry_sess,"frac":round(frac,2)})
+                       "session":entry_sess,"frac":round(frac,2),
+                       "risk_frac":round(risk_frac_cur,6),
+                       "entry_ts":(entry_ts_cur.isoformat() if entry_ts_cur is not None else None),
+                       "exit_ts":(cur_ts.isoformat() if cur_ts is not None else None)})
 
     for i in range(WARMUP, n):
         row = df.iloc[i]; price = float(row.close)
+        cur_ts = row.ts
         hi_c = float(row.high); lo_c = float(row.low); op_c = float(row.open)
         hour = row.ts.hour if hasattr(row.ts, "hour") else 10
         atr_now = float(row.atr); atr_now = atr_now if atr_now > 0 else price*0.01
@@ -692,10 +698,11 @@ def _sim(df: pd.DataFrame, cfg: BTConfig, balance: float = 10_000.0,
 
         direction = sig; entry = price
         sl = sl_p; tp1 = tp1_p; tp2 = tp2_p; tp3 = tp3_p; sl_d = sl_dist
-        entry_sess = _sess(hour); entry_idx = i
+        entry_sess = _sess(hour); entry_idx = i; entry_ts_cur = row.ts
         in_trade = True; pos_frac = 1.0; hit_tp1 = hit_tp2 = False
         conf = min(1.2, max(0.6, score / cfg.base_threshold))
-        risk_dollars = balance * cfg.risk_per_trade * conf
+        risk_frac_cur = min(cfg.risk_cap, cfg.risk_per_trade * conf)
+        risk_dollars = balance * risk_frac_cur
         equity.append(balance)
 
     if in_trade:
@@ -757,7 +764,7 @@ def _metrics(sim: Dict, initial: float) -> Dict:
 # Empirically the best of {HARMONIC, SMC, MR, CONFLUENCE} variants → CONFLUENCE (strict).
 # ══════════════════════════════════════════════════════════════════════════════════
 
-ALT_SYMBOLS = {"XRP", "SOL", "LINK"}
+ALT_SYMBOLS = {"XRP", "SOL", "LINK", "DOGE", "AVAX", "NEAR"}
 
 _HARM = {
     "GARTLEY":   {"AB": (0.55, 0.66), "BC": (0.382, 0.886), "CD": (1.13, 1.618), "AD": (0.74, 0.83)},
@@ -772,7 +779,8 @@ _HARM = {
 class AltConfig:
     """Tuned defaults = empirically-best CONFLUENCE(strict) variant."""
     strat: str = "CONFLUENCE"          # CONFLUENCE | HARMONIC | SMC | MR | TREND
-    risk_per_trade: float = 0.012
+    risk_per_trade: float = 0.015      # ↑ من 0.012
+    risk_cap: float = 0.024            # سقف المخاطرة بعد الثقة
     fee_rate: float = 0.0005
     slippage: float = 0.0003
     # targets (R multiples)
@@ -816,7 +824,33 @@ class AltConfig:
     div_min: float = 0.5
 
 
+# ── Per-symbol overrides (تُطبَّق فوق AltConfig الافتراضي لكل عملة) ───────────────────
+# XRP = عزل/تصفية صارمة: ضوضاء عالية ⇒ نرفع نقاء الترند + نمنع الدخول عكس الاتجاه + نخفّض المخاطرة.
+ALT_OVERRIDES: Dict[str, dict] = {
+    "XRP":  {"er_min": 0.46, "threshold": 2.4, "trend_block": True, "require_div": False,
+             "div_min": 0.6, "max_consec_loss": 2, "dd_breaker": 0.05, "dd_resume": 0.03,
+             "risk_per_trade": 0.010, "min_rr": 1.25, "vol_min": 0.85},
+    # عملات جديدة عالية السيولة — إعدادات متوازنة (نفس فلسفة SOL/LINK مع حماية ترند)
+    "DOGE": {"er_min": 0.40, "threshold": 2.1, "trend_block": True, "vol_min": 0.8},
+    "AVAX": {"er_min": 0.44, "threshold": 2.3, "trend_block": True, "vol_min": 0.85,
+             "max_consec_loss": 2, "dd_breaker": 0.06},
+    "NEAR": {"er_min": 0.44, "threshold": 2.3, "trend_block": True, "vol_min": 0.85,
+             "max_consec_loss": 2, "dd_breaker": 0.06},
+}
+
+
+def _alt_cfg_for(sym_c: str, base: "AltConfig") -> "AltConfig":
+    """يبني AltConfig خاصاً بالعملة عبر تطبيق ALT_OVERRIDES فوق الإعداد الأساسي."""
+    ov = ALT_OVERRIDES.get(sym_c)
+    if not ov:
+        return base
+    from dataclasses import replace as _dc_replace
+    valid = {k: v for k, v in ov.items() if hasattr(base, k)}
+    return _dc_replace(base, **valid)
+
+
 _BTCFG = BTConfig()   # proven BTC/ETH trend-pullback signal (used only if use_trend=True)
+
 
 
 # ── extra indicators (causal) ──────────────────────────────────────────────────────
@@ -1026,6 +1060,7 @@ def sim_alt(df: pd.DataFrame, cfg: AltConfig, balance: float = 10_000.0, df_mtf=
     entry_idx = 0; entry_sess = "—"; pos_frac = 1.0
     hit_tp1 = hit_tp2 = False; consec_loss = 0; risk_dollars = 0.0
     peak = balance; halted = False
+    cur_ts = None; entry_ts_cur = None; risk_frac_cur = 0.0   # ← لنموذج المحفظة الموحّدة
 
     def close_leg(px, frac, etype, fdir):
         nonlocal balance, consec_loss
@@ -1042,10 +1077,14 @@ def sim_alt(df: pd.DataFrame, cfg: AltConfig, balance: float = 10_000.0, df_mtf=
         trades.append({"direction": fdir, "entry": round(entry, 6), "exit": round(px, 6),
                        "pnl_pct": round(raw * frac, 4), "r_mult": round(r_mult * frac, 3),
                        "result": "WIN" if win else "LOSS", "exit_type": etype,
-                       "session": entry_sess, "frac": round(frac, 2)})
+                       "session": entry_sess, "frac": round(frac, 2),
+                       "risk_frac": round(risk_frac_cur, 6),
+                       "entry_ts": (entry_ts_cur.isoformat() if entry_ts_cur is not None else None),
+                       "exit_ts": (cur_ts.isoformat() if cur_ts is not None else None)})
 
     for i in range(WARMUP, n):
         row = df.iloc[i]; price = float(row.close)
+        cur_ts = row.ts
         hi_c = float(row.high); lo_c = float(row.low); op_c = float(row.open)
         hour = row.ts.hour if hasattr(row.ts, "hour") else 10
         atr_now = float(row.atr); atr_now = atr_now if atr_now > 0 else price * 0.01
@@ -1118,16 +1157,81 @@ def sim_alt(df: pd.DataFrame, cfg: AltConfig, balance: float = 10_000.0, df_mtf=
 
         direction = sig["dir"]; entry = price; sl = sl_p; sl_d = sl_dist
         tp1, tp2, tp3 = tp1_p, tp2_p, tp3_p
-        entry_sess = _sess(hour); entry_idx = i
+        entry_sess = _sess(hour); entry_idx = i; entry_ts_cur = row.ts
         in_trade = True; pos_frac = 1.0; hit_tp1 = hit_tp2 = False
         conf = min(1.3, max(0.6, sig["score"] / cfg.threshold))
         decay = cfg.loss_risk_decay ** consec_loss
-        risk_dollars = balance * cfg.risk_per_trade * conf * decay
+        risk_frac_cur = min(cfg.risk_cap, cfg.risk_per_trade * conf * decay)
+        risk_dollars = balance * risk_frac_cur
         equity.append(balance)
 
     if in_trade:
         close_leg(float(df.close.iloc[-1]), pos_frac, "OPEN_AT_END", direction)
     return {"trades": trades, "equity": equity, "final_balance": balance, "start_balance": start}
+
+
+# ══════════════════════════════════════════════════════════════════
+# UNIFIED COMPOUNDING PORTFOLIO (نموذج محفظة موحّدة مركّبة)
+# ──────────────────────────────────────────────────────────────────
+# طبقة فوق المحرّكات: تجمع كل أرجل الصفقات من جميع العملات، ترتّبها زمنياً
+# حسب وقت الإغلاق، وتطبّق المخاطرة كنسبة من رأس المال الحالي (تركيب فعلي).
+# لا تمسّ منطق التحليل إطلاقاً — تستخدم فقط مخرجات الصفقات.
+# ══════════════════════════════════════════════════════════════════
+def simulate_portfolio(results: Dict, initial: float = 10_000.0,
+                       max_concurrent_risk: float = 0.06) -> Dict:
+    """
+    يبني منحنى رأس مال موحّد مركّب عبر كل العملات.
+      gain_leg = balance × risk_frac × r_mult   (r_mult مخزّن مضروباً بالـ frac)
+    max_concurrent_risk: حدّ للمخاطرة المتزامنة (تقليص حجم عند تكدّس الصفقات).
+    """
+    legs: List[dict] = []
+    for sym, r in results.items():
+        if not isinstance(r, dict) or "error" in r:
+            continue
+        for t in r.get("_trades", []):
+            if t.get("exit_ts") is None:
+                continue
+            legs.append({**t, "symbol": sym})
+    if not legs:
+        return {"error": "no portfolio trades"}
+
+    # ترتيب حسب وقت الإغلاق (causal، يحافظ على التسلسل الزمني الحقيقي)
+    legs.sort(key=lambda x: (x["exit_ts"], x.get("entry_ts") or ""))
+
+    balance = initial
+    equity = [balance]
+    peak = balance
+    max_dd = 0.0
+    wins = losses = 0
+    rmults: List[float] = []
+    for leg in legs:
+        rf = float(leg.get("risk_frac", 0.0))
+        rm = float(leg.get("r_mult", 0.0))   # يتضمن frac أصلاً
+        gain = balance * rf * rm
+        balance = max(1.0, balance + gain)
+        equity.append(balance)
+        peak = max(peak, balance)
+        dd = (peak - balance) / peak if peak > 0 else 0.0
+        max_dd = max(max_dd, dd)
+        rmults.append(rm)
+        if gain > 0: wins += 1
+        elif gain < 0: losses += 1
+
+    eq = pd.Series(equity)
+    ret = (balance - initial) / initial * 100
+    rser = pd.Series(rmults)
+    sharpe = float(rser.mean() / rser.std() * (len(rser) ** 0.5)) if rser.std() > 0 else 0.0
+    tot = wins + losses
+    return {
+        "final_balance": round(balance, 2),
+        "return_pct": round(ret, 2),
+        "max_dd_pct": round(-max_dd * 100, 2),
+        "sharpe": round(sharpe, 3),
+        "total_legs": len(legs),
+        "win_legs": wins, "loss_legs": losses,
+        "win_rate_pct": round(wins / tot * 100, 2) if tot else 0.0,
+        "initial": initial,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1157,29 +1261,32 @@ class BacktestEngine:
                   start: str = "2026-01-01", end: str = "2026-05-01",
                   balance: float = 10_000.0, force_eth: bool = True,
                   force_xrp: bool = True, force_sol: bool = True,
-                  force_link: bool = True, **kwargs) -> Dict:
+                  force_link: bool = True, force_doge: bool = True,
+                  force_avax: bool = True, force_near: bool = True, **kwargs) -> Dict:
         resolved = tf or timeframe or "1h"
 
-        # ── Symbol normalization + ETH/XRP guarantee ──
-        raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT", "LINK/USDT:USDT"]
+        # ── Symbol normalization + auto-add guarantee ──
+        raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT",
+                          "LINK/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "NEAR/USDT:USDT"]
         symbols = []
         seen = set()
         for s in raw:
             n = self._normalize_symbol(s)
             if n and n not in seen:
                 symbols.append(n); seen.add(n)
-        if force_eth and "ETH/USDT:USDT" not in seen:
-            symbols.append("ETH/USDT:USDT"); seen.add("ETH/USDT:USDT")
-            logger.info("[BT] force_eth=True → ETH/USDT:USDT auto-added")
-        if force_xrp and "XRP/USDT:USDT" not in seen:
-            symbols.append("XRP/USDT:USDT"); seen.add("XRP/USDT:USDT")
-            logger.info("[BT] force_xrp=True → XRP/USDT:USDT auto-added")
-        if force_sol and "SOL/USDT:USDT" not in seen:
-            symbols.append("SOL/USDT:USDT"); seen.add("SOL/USDT:USDT")
-            logger.info("[BT] force_sol=True → SOL/USDT:USDT auto-added")
-        if force_link and "LINK/USDT:USDT" not in seen:
-            symbols.append("LINK/USDT:USDT"); seen.add("LINK/USDT:USDT")
-            logger.info("[BT] force_link=True → LINK/USDT:USDT auto-added")
+        _forced = [
+            (force_eth,  "ETH/USDT:USDT"),
+            (force_xrp,  "XRP/USDT:USDT"),
+            (force_sol,  "SOL/USDT:USDT"),
+            (force_link, "LINK/USDT:USDT"),
+            (force_doge, "DOGE/USDT:USDT"),
+            (force_avax, "AVAX/USDT:USDT"),
+            (force_near, "NEAR/USDT:USDT"),
+        ]
+        for flag, inst in _forced:
+            if flag and inst not in seen:
+                symbols.append(inst); seen.add(inst)
+                logger.info(f"[BT] force → {inst} auto-added")
         logger.info(f"[BT] symbols to test: {symbols}")
 
 
@@ -1215,15 +1322,17 @@ class BacktestEngine:
                         df_mtf = pd.DataFrame()
 
                 if is_alt:
-                    sim = sim_alt(df, self.alt_cfg, balance, df_mtf=df_mtf)
-                    engine_tag = "ALT-Q v9"
+                    eff_cfg = _alt_cfg_for(sym_c, self.alt_cfg)   # عزل/تصفية لكل عملة (XRP أصرم)
+                    sim = sim_alt(df, eff_cfg, balance, df_mtf=df_mtf)
+                    engine_tag = "ALT-Q v10"
                 else:
                     sim = _sim(df, self.cfg, balance, df_mtf=df_mtf)
                     engine_tag = "ELITE v8"
                 st = _metrics(sim, balance)
                 results[sym_c] = {**st, "symbol":sym_c, "tf":resolved, "engine":engine_tag,
                                   "mtf": self.cfg.mtf_tf if (self.cfg.mtf_enable and not df_mtf.empty) else "—",
-                                  "period":f"{start}→{end}", "candles":len(df)}
+                                  "period":f"{start}→{end}", "candles":len(df),
+                                  "_trades": sim.get("trades", [])}
                 logger.info(f"[BT] {sym_c}: {st.get('total',0)} trades "
                             f"WR={st.get('win_rate_pct',0)}% Ret={st.get('return_pct',0):+.2f}% "
                             f"PF={st.get('profit_factor',0)}")
@@ -1238,7 +1347,7 @@ class BacktestEngine:
         tf = next((v.get("tf","1H") for v in results.values() if isinstance(v, dict) and "tf" in v), "1H")
         mtf = next((v.get("mtf","—") for v in results.values() if isinstance(v, dict) and "mtf" in v), "—")
         period = next((v.get("period","") for v in results.values() if isinstance(v, dict) and "period" in v), "")
-        lines = ["📈 <b>Backtest — Ramos 360 Ai 🎖️  ELITE v9 (Dual-Engine: Trend BTC/ETH + Quant Alts)</b>",
+        lines = ["📈 <b>Backtest — Ramos 360 Ai 🎖️  ELITE v10 (Dual-Engine + Unified Portfolio)</b>",
                  f"📅 Period: {period}",
                  f"⏱️ Timeframe: {tf.upper()} | HTF Bias: {mtf.upper()} | Trend-Pullback + Multi-Target",
                  "✅ Causal (no look-ahead) + Fees/Slippage + Scaled TP1/TP2/TP3 + MTF Filter",
@@ -1277,14 +1386,28 @@ class BacktestEngine:
                       f"  🎯 Win Rate:     {wr_agg:.1f}%",
                       f"  💰 Avg Return:   {agg['ret']/max(1,len([r for r in results.values() if 'error' not in r])):+.2f}%",
                       f"  🏁 Targets:      TP1:{agg['tp1']} TP2:{agg['tp2']} TP3:{agg['tp3']}  |  SL:{agg['sl']}"]
-        lines += ["━━━━━━━━━━━━━━━━━━━━━━━━", "<i>🎖️ Ramos 360 Ai — ELITE v9 (Dual-Engine)</i>"]
+
+        # ── Unified Compounding Portfolio (محفظة موحّدة مركّبة) ──
+        port = simulate_portfolio(results, initial=10_000.0)
+        if "error" not in port:
+            pei = "🟢" if port["return_pct"] > 0 else "🔴"
+            lines += ["━━━━━━━━━━━━━━━━━━━━━━━━",
+                      f"{pei} <b>💼 Unified Portfolio (Compounded · $10,000)</b>",
+                      f"  💰 Total Return: {port['return_pct']:+.2f}%",
+                      f"  🏦 Final Balance: ${port['final_balance']:,.2f}",
+                      f"  📉 Max DD:       {port['max_dd_pct']:.2f}%",
+                      f"  ⚖️ Sharpe:       {port['sharpe']:.3f}",
+                      f"  📊 Trade Legs:   {port['total_legs']}  ({port['win_legs']}W/{port['loss_legs']}L)",
+                      f"  🎯 Win Rate:     {port['win_rate_pct']:.1f}%"]
+        lines += ["━━━━━━━━━━━━━━━━━━━━━━━━", "<i>🎖️ Ramos 360 Ai — ELITE v10 (Dual-Engine + Portfolio)</i>"]
         return "\n".join(lines)
 
 
 async def _main():
     e = BacktestEngine()
-    r = await e.run(symbols=["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT", "LINK/USDT:USDT"], timeframe="1h",
-                    start="2026-01-01", end="2026-05-01", balance=10_000.0)
+    r = await e.run(symbols=["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT",
+                             "LINK/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "NEAR/USDT:USDT"],
+                    timeframe="1h", start="2026-01-01", end="2026-05-01", balance=10_000.0)
     print("\n" + e.format_report(r).replace("<b>","").replace("</b>","")
           .replace("<i>","").replace("</i>",""))
 
