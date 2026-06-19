@@ -1250,17 +1250,30 @@ class MacroConfig:
     # divergence requirement
     require_div: bool = False
     div_min: float = 0.4
+    # ── Preferred Fibonacci grid (gold/silver/indices) ──
+    # used by macro_sl_tp() for structural stop & target placement.
+    fib_levels: tuple = (0.809, 0.75, 0.4045, 0.0309)
+    # trend-pullback leg (proven elite engine) — vital for trending indices/metals
+    use_trend: bool = True
+    # reversal legs (harmonic/classic/SMC/swing-extreme). Off ⇒ pure trend-following.
+    reversal_enable: bool = True
 
 
 # Per-symbol overrides (tuned for each asset's character)
 MACRO_OVERRIDES: Dict[str, dict] = {
-    "XAUUSD":  {"threshold": 2.1, "er_min": 0.30, "risk_per_trade": 0.014},   # gold trends well
-    "XAGUSD":  {"threshold": 2.4, "er_min": 0.36, "risk_per_trade": 0.011,    # silver noisier
+    # GOLD: combines reversal (harmonic/classic/SMC) + trend pullback. Fib stops via
+    #       preferred grid; trends well so a wider SL cap lets winners breathe.
+    "XAUUSD":  {"reversal_enable": True,  "er_min": 0.32, "sl_atr_max": 3.2,
+                "risk_per_trade": 0.014},
+    # SILVER: noisier — pure trend-following (reversal off) is far cleaner here.
+    "XAGUSD":  {"reversal_enable": False, "er_min": 0.30, "risk_per_trade": 0.013,
                 "max_consec_loss": 2, "dd_breaker": 0.05},
-    "SPX":     {"threshold": 2.0, "er_min": 0.28, "risk_per_trade": 0.014,    # SPX smoother
-                "sl_atr_min": 1.4, "sl_atr_max": 2.6},
-    "NDX":     {"threshold": 2.2, "er_min": 0.32, "risk_per_trade": 0.013,    # NDX more volatile
-                "sl_atr_min": 1.6, "sl_atr_max": 3.0},
+    # INDICES (E-mini ES/NQ): strongly trending → trend-only, looser quality gates
+    #       to admit the few valid 1H pullbacks. Lower risk (fewer, lower-edge setups).
+    "SPX":     {"reversal_enable": False, "er_min": 0.18, "adx_min": 10.0,
+                "sl_atr_min": 1.4, "sl_atr_max": 2.4, "risk_per_trade": 0.012},
+    "NDX":     {"reversal_enable": False, "er_min": 0.18, "adx_min": 10.0,
+                "sl_atr_min": 1.6, "sl_atr_max": 2.4, "risk_per_trade": 0.012},
 }
 
 
@@ -1360,7 +1373,10 @@ def _classic_pattern(z, i: int, price: float, tol: float = 0.025):
     Detect Double Top / Double Bottom / Head & Shoulders (and inverse).
     Returns dict {dir, name, score, anchor} or None. Uses confirmed zigzag pivots only.
     """
-    pts = _confirmed(z, i)
+    # z is already a list of CONFIRMED pivots (idx, price, type) — do NOT
+    # call _confirmed() again (that expects raw 4-tuples and caused
+    # 'tuple index out of range' on every macro symbol).
+    pts = list(z)
     if len(pts) < 4:
         return None
     last = pts[-4:]
@@ -1408,27 +1424,38 @@ def macro_signal(df, z, i, cfg: MacroConfig, df_mtf=None):
 
     candidates = []
 
-    # 1) Harmonic patterns
-    harm = harmonic_at(z, i, price, cfg)
-    if harm:
-        candidates.append((harm["dir"], 2.0, harm["X"], "HARM_" + harm["name"]))
+    if getattr(cfg, "reversal_enable", True):
+        # 1) Harmonic patterns
+        harm = harmonic_at(z, i, price, cfg)
+        if harm:
+            candidates.append((harm["dir"], 2.0, harm["X"], "HARM_" + harm["name"]))
 
-    # 2) Classic patterns (Double Top/Bottom, H&S, Inv H&S)
-    clas = _classic_pattern(z, i, price)
-    if clas:
-        candidates.append((clas["dir"], clas["score"], clas["anchor"], "CLASSIC_" + clas["name"]))
+        # 2) Classic patterns (Double Top/Bottom, H&S, Inv H&S)
+        clas = _classic_pattern(z, i, price)
+        if clas:
+            candidates.append((clas["dir"], clas["score"], clas["anchor"], "CLASSIC_" + clas["name"]))
 
-    # 3) SMC liquidity sweep + premium/discount
-    sm = smc_at(df, z, i, price)
-    if sm:
-        candidates.append((sm["dir"], 0.6 + sm["score"], sm["sl"], "SMC_SWEEP"))
+        # 3) SMC liquidity sweep + premium/discount
+        sm = smc_at(df, z, i, price)
+        if sm:
+            candidates.append((sm["dir"], 0.6 + sm["score"], sm["sl"], "SMC_SWEEP"))
 
-    # 4) Swing-extreme reversal (highest high / lowest low) + reversal candle hint
-    sx = _swing_extreme(df, i, cfg.swing_lookback)
-    if sx == "HH":
-        candidates.append(("SHORT", 1.4, float(row.high), "EXTREME_HH"))
-    elif sx == "LL":
-        candidates.append(("LONG", 1.4, float(row.low),  "EXTREME_LL"))
+        # 4) Swing-extreme reversal (highest high / lowest low) + reversal candle hint
+        sx = _swing_extreme(df, i, cfg.swing_lookback)
+        if sx == "HH":
+            candidates.append(("SHORT", 1.4, float(row.high), "EXTREME_HH"))
+        elif sx == "LL":
+            candidates.append(("LONG", 1.4, float(row.low),  "EXTREME_LL"))
+
+    # 5) Trend-pullback (proven ELITE engine) — trade WITH the trend on
+    #    strongly trending markets (indices/metals); reduces counter-trend losses.
+    if getattr(cfg, "use_trend", True):
+        lb = 50
+        hi_sw = float(df.high.iloc[max(0, i - lb):i + 1].max())
+        lo_sw = float(df.low.iloc[max(0, i - lb):i + 1].min())
+        tdir, tsc, _td = _elite_signal(df, i, hi_sw, lo_sw, _BTCFG, df_mtf=df_mtf)
+        if tdir in ("LONG", "SHORT"):
+            candidates.append((tdir, 2.0, None, "TREND_PB"))
 
     if not candidates:
         return None
@@ -1444,7 +1471,7 @@ def macro_signal(df, z, i, cfg: MacroConfig, df_mtf=None):
             continue
         # Candle / structure
         st_ok, st_sc = _structure_signal(df, i, direction)
-        if not st_ok and not tag.startswith(("HARM", "CLASSIC")):
+        if not st_ok and not tag.startswith(("HARM", "CLASSIC", "TREND")):
             continue
 
         # RSI/OBV divergence bonus (your "golden ratio" momentum confirmation)
@@ -1483,6 +1510,88 @@ def macro_signal(df, z, i, cfg: MacroConfig, df_mtf=None):
         if best is None or total > best["score"]:
             best = cand
     return best
+
+
+# ── PREFERRED FIBONACCI GRID for the MACRO engine ───────────────────────────────
+# المستويات المفضّلة المطلوبة: 0.809 / 0.75 / 0.4045 / 0.0309
+MACRO_FIB = (0.809, 0.75, 0.4045, 0.0309)
+
+
+def macro_sl_tp(price, direction, sl_anchor, atr, cfg: "MacroConfig", df, i):
+    """
+    SL/TP placement for the MACRO engine using the preferred Fibonacci grid
+    (0.809 / 0.75 / 0.4045 / 0.0309) measured on the recent swing range.
+
+      • Deep retracements (0.809 / 0.75)   → structural invalidation → Stop-Loss anchor
+      • Shallow retracements (0.4045/0.0309)→ fib-projection targets blended with R-multiples
+
+    ATR-clamped (sl_atr_min/max) so a fib level never makes the stop absurdly
+    tight or wide. Returns (sl, sl_dist, tp1, tp2, tp3) or None.
+    """
+    lb = max(20, cfg.swing_lookback)
+    hi = float(df.high.iloc[max(0, i - lb):i + 1].max())
+    lo = float(df.low.iloc[max(0, i - lb):i + 1].min())
+    rng = hi - lo
+    buf = atr * cfg.sl_buffer_atr
+    fibs = list(cfg.fib_levels) if getattr(cfg, "fib_levels", None) else list(MACRO_FIB)
+    deep = [r for r in fibs if r >= 0.5]      # 0.809 / 0.75  → stop zone
+    shallow = [r for r in fibs if r < 0.5]    # 0.4045 / 0.0309 → target zone
+
+    if direction == "LONG":
+        # structural stop = below the deepest preferred fib retracement of the swing
+        cands = [hi - rng * r for r in deep if rng > 0 and (hi - rng * r) < price * 0.999]
+        if cands:
+            base = max(cands)
+        elif sl_anchor is not None and sl_anchor < price:
+            base = sl_anchor
+        else:
+            base = float(df.slo14.iloc[i])
+        sl = base - buf
+        sl = min(sl, price - atr * cfg.sl_atr_min)
+        sl = max(sl, price - atr * cfg.sl_atr_max)
+        sl_d = price - sl
+    else:
+        cands = [lo + rng * r for r in deep if rng > 0 and (lo + rng * r) > price * 1.001]
+        if cands:
+            base = min(cands)
+        elif sl_anchor is not None and sl_anchor > price:
+            base = sl_anchor
+        else:
+            base = float(df.shi14.iloc[i])
+        sl = base + buf
+        sl = max(sl, price + atr * cfg.sl_atr_min)
+        sl = min(sl, price + atr * cfg.sl_atr_max)
+        sl_d = sl - price
+
+    if sl_d <= 0:
+        return None
+
+    # Base scaled R-multiple targets (proven), then blend fib projection of the swing.
+    if direction == "LONG":
+        tp1 = price + sl_d * cfg.tp1_r
+        tp2 = price + sl_d * cfg.tp2_r
+        tp3 = price + sl_d * cfg.tp3_r
+        if rng > 0 and shallow:
+            # project the swing range upward by (1 + shallow ratio): a fib-measured move
+            proj = sorted([price + rng * (1.0 + r) for r in shallow])
+            ups = [v for v in proj if v > price * 1.003]
+            if len(ups) >= 1 and ups[0] > tp2:
+                tp2 = ups[0]
+            if len(ups) >= 2 and ups[-1] > tp3:
+                tp3 = ups[-1]
+    else:
+        tp1 = price - sl_d * cfg.tp1_r
+        tp2 = price - sl_d * cfg.tp2_r
+        tp3 = price - sl_d * cfg.tp3_r
+        if rng > 0 and shallow:
+            proj = sorted([price - rng * (1.0 + r) for r in shallow], reverse=True)
+            dns = [v for v in proj if v < price * 0.997]
+            if len(dns) >= 1 and dns[0] < tp2:
+                tp2 = dns[0]
+            if len(dns) >= 2 and dns[-1] < tp3:
+                tp3 = dns[-1]
+
+    return round(sl, 6), round(sl_d, 8), round(tp1, 6), round(tp2, 6), round(tp3, 6)
 
 
 def sim_macro(df: pd.DataFrame, cfg: MacroConfig, balance: float = 10_000.0, df_mtf=None) -> Dict:
@@ -1579,7 +1688,7 @@ def sim_macro(df: pd.DataFrame, cfg: MacroConfig, balance: float = 10_000.0, df_
         sig = macro_signal(df, z, i, cfg, df_mtf=df_mtf)
         if not sig:
             equity.append(balance); continue
-        out = alt_sl_tp(price, sig["dir"], sig["sl_anchor"], atr_now, cfg, df, i)
+        out = macro_sl_tp(price, sig["dir"], sig["sl_anchor"], atr_now, cfg, df, i)
         if not out:
             equity.append(balance); continue
         sl_p, sl_dist, tp1_p, tp2_p, tp3_p = out
