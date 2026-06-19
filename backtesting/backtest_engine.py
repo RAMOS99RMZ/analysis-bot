@@ -891,18 +891,7 @@ def zigzag_dev(df: pd.DataFrame, atr_mult: float = 2.2) -> List[Tuple[int, float
 
 
 def _confirmed(piv, i: int) -> List[Tuple[int, float, str]]:
-    # Idempotent: accepts both raw 4-tuples (idx, price, kind, confirm_idx)
-    # and already-confirmed 3-tuples (idx, price, kind). Prevents
-    # IndexError when called twice in a row (e.g. macro engine path).
-    out = []
-    for p in piv:
-        if len(p) >= 4:
-            if p[3] <= i:
-                out.append((p[0], p[1], p[2]))
-        elif len(p) == 3:
-            if p[0] <= i:
-                out.append((p[0], p[1], p[2]))
-    return out
+    return [(p[0], p[1], p[2]) for p in piv if p[3] <= i]
 
 
 def _ratio(a, b):
@@ -1196,59 +1185,6 @@ def sim_alt(df: pd.DataFrame, cfg: AltConfig, balance: float = 10_000.0, df_mtf=
 # Fibonacci Golden Ratios (0.618 / 0.786 / 1.272 / 1.618) + Swing Extremes (HH/LL).
 # BTC/ETH (ELITE v8) and Alt (ALT-Q v10) engines are NOT touched.
 # ══════════════════════════════════════════════════════════════════════════════════
-
-# User-preferred Fibonacci ratios for the MacroQuant engine (Gold/Silver/SPX/NDX).
-# Deep retracements (0.809 / 0.75)  → preferred SL anchors (room for noise).
-# Shallow retracements (0.4045 / 0.309) → preferred TP1 / partial-take levels.
-MACRO_FIB_PREF: List[float] = [0.309, 0.4045, 0.75, 0.809]
-MACRO_FIB_SL:   List[float] = [0.75, 0.809]
-MACRO_FIB_TP:   List[float] = [0.309, 0.4045]
-
-
-def macro_sl_tp(price, direction, sl_anchor, atr, cfg, df, i,
-                hi_sw: float = None, lo_sw: float = None):
-    """
-    Macro SL/TP that respects user-preferred Fibonacci ratios.
-    Falls back to alt_sl_tp logic if no valid swing range is provided.
-    SL  → snaps to nearest deep fib (0.75 / 0.809) of the active swing range.
-    TPs → TP1 uses fib-extension (1 + 0.4045), TP2 (1 + 0.75), TP3 (1 + 1.272).
-    """
-    base = alt_sl_tp(price, direction, sl_anchor, atr, cfg, df, i)
-    if not base:
-        return None
-    sl, sl_d, tp1, tp2, tp3 = base
-    try:
-        if hi_sw is not None and lo_sw is not None and hi_sw > lo_sw:
-            rng = hi_sw - lo_sw
-            if direction == "LONG":
-                cands = [hi_sw - rng * r for r in MACRO_FIB_SL]
-                cands = [c for c in cands if c < price]
-                if cands:
-                    fib_sl = max(cands) - atr * getattr(cfg, "sl_buffer_atr", 0.25)
-                    fib_sl = min(fib_sl, price - atr * getattr(cfg, "sl_atr_min", 1.0))
-                    fib_sl = max(fib_sl, price - atr * getattr(cfg, "sl_atr_max", 3.5))
-                    if fib_sl < price:
-                        sl = fib_sl; sl_d = price - sl
-                tp1 = price + sl_d * (1.0 + MACRO_FIB_TP[1])   # +0.4045 R
-                tp2 = price + sl_d * (1.0 + MACRO_FIB_SL[0])   # +0.75   R
-                tp3 = price + sl_d * (1.0 + 1.272)
-            else:
-                cands = [lo_sw + rng * r for r in MACRO_FIB_SL]
-                cands = [c for c in cands if c > price]
-                if cands:
-                    fib_sl = min(cands) + atr * getattr(cfg, "sl_buffer_atr", 0.25)
-                    fib_sl = max(fib_sl, price + atr * getattr(cfg, "sl_atr_min", 1.0))
-                    fib_sl = min(fib_sl, price + atr * getattr(cfg, "sl_atr_max", 3.5))
-                    if fib_sl > price:
-                        sl = fib_sl; sl_d = sl - price
-                tp1 = price - sl_d * (1.0 + MACRO_FIB_TP[1])
-                tp2 = price - sl_d * (1.0 + MACRO_FIB_SL[0])
-                tp3 = price - sl_d * (1.0 + 1.272)
-    except Exception:
-        pass
-    return round(sl, 6), round(sl_d, 8), round(tp1, 6), round(tp2, 6), round(tp3, 6)
-
-
 
 MACRO_SYMBOLS = {"XAUUSD", "XAGUSD", "SPX", "NDX", "NASDAQ", "GOLD", "SILVER", "ES", "NQ"}
 
@@ -1643,13 +1579,7 @@ def sim_macro(df: pd.DataFrame, cfg: MacroConfig, balance: float = 10_000.0, df_
         sig = macro_signal(df, z, i, cfg, df_mtf=df_mtf)
         if not sig:
             equity.append(balance); continue
-        try:
-            hi_sw = float(row.hh50) if "hh50" in df.columns else None
-            lo_sw = float(row.ll50) if "ll50" in df.columns else None
-        except Exception:
-            hi_sw = lo_sw = None
-        out = macro_sl_tp(price, sig["dir"], sig["sl_anchor"], atr_now, cfg, df, i,
-                          hi_sw=hi_sw, lo_sw=lo_sw)
+        out = alt_sl_tp(price, sig["dir"], sig["sl_anchor"], atr_now, cfg, df, i)
         if not out:
             equity.append(balance); continue
         sl_p, sl_dist, tp1_p, tp2_p, tp3_p = out
