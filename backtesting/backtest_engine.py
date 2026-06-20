@@ -305,7 +305,8 @@ def _add_div(df: pd.DataFrame, k: int = 3) -> pd.DataFrame:
                 if b[1] > a[1] and b[2] < a[2]:   sc.iloc[i] -= 1.0
                 elif b[1] < a[1] and b[2] > a[2]: sc.iloc[i] -= 0.5
     # آخر إشارة غير صفرية ضمن نافذة k+2 (decay آمن)
-    raw = sc.replace(0, pd.NA).ffill(limit=k + 2).fillna(0)
+    # pandas >= 2.2: تجنّب FutureWarning الخاص بالـ downcasting بدون تغيير المنطق.
+    raw = sc.mask(sc.eq(0)).ffill(limit=k + 2).fillna(0).infer_objects(copy=False)
     df["div_sc"] = raw.astype(float).clip(-1.5, 1.5)
     return df
 
@@ -1956,6 +1957,53 @@ class BacktestEngine:
         return "\n".join(lines)
 
 
+def _telegram_plain(text: str) -> str:
+    """Minimal HTML tag stripper for Telegram fallback only."""
+    return (text.replace("<b>", "").replace("</b>", "")
+                .replace("<i>", "").replace("</i>", "")
+                .replace("<u>", "").replace("</u>", ""))
+
+
+def _telegram_chunks(text: str, limit: int = 3900) -> List[str]:
+    """Split Telegram text safely below the 4096-char hard limit.
+
+    Important: the old sender failed after adding XAU/XAG/SPX/NDX because it sent
+    the whole report in one request. This splitter preserves the report and also
+    handles any single overlong line, so Telegram never receives a too-long body.
+    """
+    if not text:
+        return []
+    safe_limit = max(500, min(int(limit), 3900))
+    chunks: List[str] = []
+    buf = ""
+
+    def push(part: str) -> None:
+        nonlocal buf
+        if not part:
+            return
+        while len(part) > safe_limit:
+            head, part = part[:safe_limit], part[safe_limit:]
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            chunks.append(head)
+        if not part:
+            return
+        candidate = f"{buf}\n{part}" if buf else part
+        if len(candidate) <= safe_limit:
+            buf = candidate
+        else:
+            if buf:
+                chunks.append(buf)
+            buf = part
+
+    for line in text.splitlines():
+        push(line)
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
 async def _send_telegram(html_text: str) -> None:
     """Send the backtest report to Telegram. Reads env vars:
        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (aliases supported)."""
@@ -1967,38 +2015,52 @@ async def _send_telegram(html_text: str) -> None:
     if not token or not chat_id:
         logger.warning("Telegram disabled: missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars.")
         return
+
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    # Telegram hard-limit per message = 4096 chars. Split on line boundaries.
-    MAX = 3900
-    chunks, buf = [], ""
-    for ln in html_text.split("\n"):
-        if len(buf) + len(ln) + 1 > MAX:
-            chunks.append(buf); buf = ln
-        else:
-            buf = (buf + "\n" + ln) if buf else ln
-    if buf:
-        chunks.append(buf)
+    chunks = _telegram_chunks(html_text, limit=3900)
+    if not chunks:
+        logger.warning("Telegram disabled: empty report.")
+        return
+
     async with httpx.AsyncClient(timeout=30.0) as cli:
         for i, ch in enumerate(chunks, 1):
-            try:
-                resp = await cli.post(url, json={
-                    "chat_id": chat_id,
-                    "text": ch,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                })
-                if resp.status_code != 200:
-                    # Retry once without HTML parse_mode in case of entity errors
-                    logger.warning(f"Telegram chunk {i}/{len(chunks)} HTTP {resp.status_code}: {resp.text[:200]}")
-                    plain = ch.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","")
-                    resp2 = await cli.post(url, json={"chat_id": chat_id, "text": plain,
-                                                       "disable_web_page_preview": True})
-                    if resp2.status_code != 200:
-                        logger.error(f"Telegram retry failed: {resp2.text[:200]}")
-                else:
-                    logger.info(f"Telegram sent chunk {i}/{len(chunks)} ({len(ch)} chars).")
-            except Exception as ex:
-                logger.error(f"Telegram send error on chunk {i}: {ex}")
+            prefix = f"<b>Part {i}/{len(chunks)}</b>\n" if len(chunks) > 1 else ""
+            body = prefix + ch
+            if len(body) > 4096:
+                # Prefix can push an edge chunk over the limit; split once more safely.
+                extra_parts = _telegram_chunks(ch, limit=3800)
+            else:
+                extra_parts = [ch]
+
+            for j, part in enumerate(extra_parts, 1):
+                sub_prefix = f"<b>Part {i}.{j}/{len(chunks)}</b>\n" if len(extra_parts) > 1 else prefix
+                payload_text = sub_prefix + part
+                try:
+                    resp = await cli.post(url, json={
+                        "chat_id": chat_id,
+                        "text": payload_text,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    })
+                    if resp.status_code != 200:
+                        # Retry once without HTML parse_mode in case of entity errors.
+                        logger.warning(f"Telegram chunk {i}/{len(chunks)} HTTP {resp.status_code}: {resp.text[:300]}")
+                        plain = _telegram_plain(payload_text)
+                        if len(plain) > 4096:
+                            plain = plain[:4050] + "\n..."
+                        resp2 = await cli.post(url, json={
+                            "chat_id": chat_id,
+                            "text": plain,
+                            "disable_web_page_preview": True,
+                        })
+                        if resp2.status_code != 200:
+                            logger.error(f"Telegram retry failed chunk {i}/{len(chunks)}: {resp2.text[:300]}")
+                        else:
+                            logger.info(f"Telegram sent chunk {i}/{len(chunks)} as plain text ({len(plain)} chars).")
+                    else:
+                        logger.info(f"Telegram sent chunk {i}/{len(chunks)} ({len(payload_text)} chars).")
+                except Exception as ex:
+                    logger.error(f"Telegram send error on chunk {i}/{len(chunks)}: {ex}")
 
 
 async def _main():
