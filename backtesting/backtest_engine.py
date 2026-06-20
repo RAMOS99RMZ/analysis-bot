@@ -1956,14 +1956,63 @@ class BacktestEngine:
         return "\n".join(lines)
 
 
+async def _send_telegram(html_text: str) -> None:
+    """Send the backtest report to Telegram. Reads env vars:
+       TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (aliases supported)."""
+    import os
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TG_BOT_TOKEN")
+             or os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN"))
+    chat_id = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_CHAT_ID")
+               or os.getenv("CHAT_ID"))
+    if not token or not chat_id:
+        logger.warning("Telegram disabled: missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars.")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    # Telegram hard-limit per message = 4096 chars. Split on line boundaries.
+    MAX = 3900
+    chunks, buf = [], ""
+    for ln in html_text.split("\n"):
+        if len(buf) + len(ln) + 1 > MAX:
+            chunks.append(buf); buf = ln
+        else:
+            buf = (buf + "\n" + ln) if buf else ln
+    if buf:
+        chunks.append(buf)
+    async with httpx.AsyncClient(timeout=30.0) as cli:
+        for i, ch in enumerate(chunks, 1):
+            try:
+                resp = await cli.post(url, json={
+                    "chat_id": chat_id,
+                    "text": ch,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                })
+                if resp.status_code != 200:
+                    # Retry once without HTML parse_mode in case of entity errors
+                    logger.warning(f"Telegram chunk {i}/{len(chunks)} HTTP {resp.status_code}: {resp.text[:200]}")
+                    plain = ch.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","")
+                    resp2 = await cli.post(url, json={"chat_id": chat_id, "text": plain,
+                                                       "disable_web_page_preview": True})
+                    if resp2.status_code != 200:
+                        logger.error(f"Telegram retry failed: {resp2.text[:200]}")
+                else:
+                    logger.info(f"Telegram sent chunk {i}/{len(chunks)} ({len(ch)} chars).")
+            except Exception as ex:
+                logger.error(f"Telegram send error on chunk {i}: {ex}")
+
+
 async def _main():
     e = BacktestEngine()
     r = await e.run(symbols=["BTC/USDT:USDT","ETH/USDT:USDT","XRP/USDT:USDT","SOL/USDT:USDT",
                              "LINK/USDT:USDT","DOGE/USDT:USDT","AVAX/USDT:USDT","NEAR/USDT:USDT",
                              "XAUUSD","XAGUSD","SPX","NDX"],
                     timeframe="1h", start="2026-01-01", end="2026-05-01", balance=10_000.0)
-    print("\n" + e.format_report(r).replace("<b>","").replace("</b>","")
+    report_html = e.format_report(r)
+    # Console (plain)
+    print("\n" + report_html.replace("<b>","").replace("</b>","")
           .replace("<i>","").replace("</i>",""))
+    # Telegram (HTML, split-safe)
+    await _send_telegram(report_html)
 
 
 if __name__ == "__main__":
