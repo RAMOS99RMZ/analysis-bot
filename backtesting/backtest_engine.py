@@ -766,7 +766,8 @@ def _metrics(sim: Dict, initial: float) -> Dict:
 # Empirically the best of {HARMONIC, SMC, MR, CONFLUENCE} variants → CONFLUENCE (strict).
 # ══════════════════════════════════════════════════════════════════════════════════
 
-ALT_SYMBOLS = {"XRP", "SOL", "LINK", "DOGE", "AVAX", "NEAR"}
+# ⚠️ تم حذف XRP / AVAX / NEAR (أداء سلبي مؤكَّد عبر backtest) — الإبقاء على الأصول الرابحة فقط.
+ALT_SYMBOLS = {"SOL", "LINK", "DOGE"}
 
 _HARM = {
     "GARTLEY":   {"AB": (0.55, 0.66), "BC": (0.382, 0.886), "CD": (1.13, 1.618), "AD": (0.74, 0.83)},
@@ -829,15 +830,8 @@ class AltConfig:
 # ── Per-symbol overrides (تُطبَّق فوق AltConfig الافتراضي لكل عملة) ───────────────────
 # XRP = عزل/تصفية صارمة: ضوضاء عالية ⇒ نرفع نقاء الترند + نمنع الدخول عكس الاتجاه + نخفّض المخاطرة.
 ALT_OVERRIDES: Dict[str, dict] = {
-    "XRP":  {"er_min": 0.46, "threshold": 2.4, "trend_block": True, "require_div": False,
-             "div_min": 0.6, "max_consec_loss": 2, "dd_breaker": 0.05, "dd_resume": 0.03,
-             "risk_per_trade": 0.010, "min_rr": 1.25, "vol_min": 0.85},
     # عملات جديدة عالية السيولة — إعدادات متوازنة (نفس فلسفة SOL/LINK مع حماية ترند)
     "DOGE": {"er_min": 0.40, "threshold": 2.1, "trend_block": True, "vol_min": 0.8},
-    "AVAX": {"er_min": 0.44, "threshold": 2.3, "trend_block": True, "vol_min": 0.85,
-             "max_consec_loss": 2, "dd_breaker": 0.06},
-    "NEAR": {"er_min": 0.44, "threshold": 2.3, "trend_block": True, "vol_min": 0.85,
-             "max_consec_loss": 2, "dd_breaker": 0.06},
 }
 
 
@@ -1821,17 +1815,16 @@ class BacktestEngine:
     async def run(self, symbols: List[str] = None, timeframe: str = "1h", tf: str = None,
                   start: str = "2026-01-01", end: str = "2026-05-01",
                   balance: float = 10_000.0, force_eth: bool = True,
-                  force_xrp: bool = True, force_sol: bool = True,
+                  force_sol: bool = True,
                   force_link: bool = True, force_doge: bool = True,
-                  force_avax: bool = True, force_near: bool = True,
                   force_xauusd: bool = True, force_xagusd: bool = True,
                   force_spx: bool = True, force_nasdaq: bool = True,
                   **kwargs) -> Dict:
         resolved = tf or timeframe or "1h"
 
         # ── Symbol normalization + auto-add guarantee ──
-        raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT",
-                          "LINK/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "NEAR/USDT:USDT",
+        raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+                          "LINK/USDT:USDT", "DOGE/USDT:USDT",
                           "XAUUSD", "XAGUSD", "SPX", "NDX"]
         symbols = []
         seen = set()
@@ -1841,12 +1834,9 @@ class BacktestEngine:
                 symbols.append(n); seen.add(n)
         _forced = [
             (force_eth,     "ETH/USDT:USDT"),
-            (force_xrp,     "XRP/USDT:USDT"),
             (force_sol,     "SOL/USDT:USDT"),
             (force_link,    "LINK/USDT:USDT"),
             (force_doge,    "DOGE/USDT:USDT"),
-            (force_avax,    "AVAX/USDT:USDT"),
-            (force_near,    "NEAR/USDT:USDT"),
             (force_xauusd,  "XAUUSD"),
             (force_xagusd,  "XAGUSD"),
             (force_spx,     "SPX"),
@@ -1939,50 +1929,96 @@ class BacktestEngine:
         tf = next((v.get("tf","1H") for v in results.values() if isinstance(v, dict) and "tf" in v), "1H")
         mtf = next((v.get("mtf","—") for v in results.values() if isinstance(v, dict) and "mtf" in v), "—")
         period = next((v.get("period","") for v in results.values() if isinstance(v, dict) and "period" in v), "")
-        lines = ["📈 <b>Backtest — Ramos 360 Ai 🎖️ ELITE v13</b>",
-                 f"📅 <b>Period:</b> {period}",
-                 f"⏱️ <b>TF:</b> {tf.upper()} | <b>HTF:</b> {mtf.upper()} | Tri-Engine + Portfolio",
-                 "✅ Causal · Fees/Slippage · TP1/TP2/TP3 · MTF",
-                 "━━━━━━━━━━━━━━━━━━━━"]
-        agg = {"total":0,"wins":0,"losses":0,"ret":0.0,"tp1":0,"tp2":0,"tp3":0,"sl":0}
+        DIV  = "━━━━━━━━━━━━━━━━━━━━"
+        SDIV = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+        lines = [
+            "📈 <b>Ramos 360 Ai — Backtest Report</b>  🎖️",
+            f"📅 <b>Period:</b>  <code>{period}</code>",
+            f"⏱️ <b>Timeframe:</b>  {tf.upper()}   ·   <b>HTF:</b>  {mtf.upper()}",
+            "⚙️ Tri-Engine  ·  Causal  ·  Fees/Slip  ·  TP1/TP2/TP3  ·  MTF",
+            DIV,
+            "📊 <b>Per-Asset Performance</b>",
+            SDIV,
+        ]
+        agg = {"total":0,"wins":0,"losses":0,"ret":0.0,
+               "tp1":0,"tp2":0,"tp3":0,"sl":0}
         valid_count = 0
-        for sym, r in results.items():
+        # رتّب حسب العائد تنازلياً للقراءة الأنيقة
+        items = list(results.items())
+        items.sort(key=lambda kv: (kv[1].get("return_pct", -1e9)
+                                   if isinstance(kv[1], dict) and "error" not in kv[1]
+                                   else -1e9),
+                   reverse=True)
+        for sym, r in items:
             disp = r.get("display", sym) if isinstance(r, dict) else sym
-            if "error" in r:
-                lines.append(f"❌ {disp}: {r['error']}"); continue
+            if not isinstance(r, dict) or "error" in r:
+                err = r.get("error","unknown") if isinstance(r, dict) else "n/a"
+                lines += [f"⚪ <b>{disp}</b>  —  <i>skipped ({err})</i>", SDIV]
+                continue
             valid_count += 1
-            ei = "🟢" if r.get("return_pct", 0) > 0 else "🔴"
-            tph = r.get("tp_hits", {})
+            ret = r.get("return_pct", 0)
+            ei  = "🟢" if ret > 0 else ("🔴" if ret < 0 else "⚪")
+            tph   = r.get("tp_hits", {})
             exits = r.get("exit_breakdown", {})
-            agg["total"] += r.get("total",0); agg["wins"] += r.get("wins",0); agg["losses"] += r.get("losses",0)
-            agg["ret"] += r.get("return_pct",0)
-            agg["tp1"] += tph.get("TP1",0); agg["tp2"] += tph.get("TP2",0); agg["tp3"] += tph.get("TP3",0)
-            agg["sl"]  += exits.get("SL",0)
-            lines += [f"{ei} <b>{disp}</b> · {r.get('engine','—')} | {r['total']}T ({r.get('wins',0)}W/{r.get('losses',0)}L) | WR {r['win_rate_pct']:.1f}% | Ret {r.get('return_pct',0):+.2f}%",
-                      f"   PF {r.get('profit_factor',0)} · DD {r.get('max_dd_pct',0):.2f}% · TP {tph.get('TP1',0)}/{tph.get('TP2',0)}/{tph.get('TP3',0)} · SL {exits.get('SL',0)} · Bal ${r.get('final_balance',10000):,.0f}"]
-        # Aggregate
+            sl_n  = exits.get("SL", 0)
+            tp1, tp2, tp3 = tph.get("TP1",0), tph.get("TP2",0), tph.get("TP3",0)
+            be_n   = exits.get("BE", 0) + exits.get("TRAIL", 0) + exits.get("TIME", 0)
+            tot    = r.get("total", 0)
+            wins_n = r.get("wins", 0); losses_n = r.get("losses", 0)
+            wr     = r.get("win_rate_pct", 0)
+            pf     = r.get("profit_factor", 0)
+            dd     = r.get("max_dd_pct", 0)
+            sh     = r.get("sharpe", 0)
+            bal    = r.get("final_balance", 10000)
+            aw     = r.get("avg_win_pct", 0)
+            al     = r.get("avg_loss_pct", 0)
+            avg_r  = r.get("avg_r", 0)
+            expc   = r.get("expectancy", 0)
+            engine = r.get("engine", "—")
+
+            agg["total"] += tot; agg["wins"] += wins_n; agg["losses"] += losses_n
+            agg["ret"]   += ret
+            agg["tp1"]   += tp1; agg["tp2"] += tp2; agg["tp3"] += tp3
+            agg["sl"]    += sl_n
+
+            lines += [
+                f"{ei} <b>{disp}</b>   <i>· {engine}</i>",
+                f"   💰 <b>Return:</b> {ret:+.2f}%   ·   🏦 Bal: <code>${bal:,.0f}</code>",
+                f"   🎯 <b>Win Rate:</b> {wr:.1f}%   ({wins_n}W / {losses_n}L · {tot} trades)",
+                f"   📈 <b>PF:</b> {pf}   ·   ⚖️ <b>Sharpe:</b> {sh}   ·   📉 <b>DD:</b> {dd:.2f}%",
+                f"   🏁 <b>Targets:</b>  TP1 {tp1}  ·  TP2 {tp2}  ·  TP3 {tp3}   |   SL {sl_n}   |   BE/Trail {be_n}",
+                f"   📐 Avg R: {avg_r}   ·   Avg Win: {aw:+.2f}%   ·   Avg Loss: {al:+.2f}%   ·   Exp: {expc:+.3f}%",
+                SDIV,
+            ]
+
+        # ── Aggregate (All Symbols) ──
         if agg["total"] > 0:
             wr_agg = (agg["wins"]/agg["total"]*100) if agg["total"] else 0
-            lines += ["━━━━━━━━━━━━━━━━━━━━",
-                      "🧮 <b>Aggregate (All Symbols)</b>",
-                      f"  📊 Total Trades: {agg['total']}  ({agg['wins']}W/{agg['losses']}L)",
-                      f"  🎯 Win Rate:     {wr_agg:.1f}%",
-                      f"  💰 Avg Return:   {agg['ret']/max(1, valid_count):+.2f}%",
-                      f"  🏁 Targets:      TP1:{agg['tp1']} TP2:{agg['tp2']} TP3:{agg['tp3']}  |  SL:{agg['sl']}"]
+            lines += [
+                "🧮 <b>Aggregate — All Symbols</b>",
+                f"   📊 Trades: <b>{agg['total']}</b>   ({agg['wins']}W / {agg['losses']}L)",
+                f"   🎯 Win Rate: <b>{wr_agg:.1f}%</b>",
+                f"   💰 Avg Return / Asset: <b>{agg['ret']/max(1, valid_count):+.2f}%</b>",
+                f"   🏁 Targets:  TP1 {agg['tp1']}  ·  TP2 {agg['tp2']}  ·  TP3 {agg['tp3']}   |   SL {agg['sl']}",
+                DIV,
+            ]
 
         # ── Unified Compounding Portfolio ──
         port = simulate_portfolio(results, initial=10_000.0)
         if "error" not in port:
             pei = "🟢" if port["return_pct"] > 0 else "🔴"
-            lines += ["━━━━━━━━━━━━━━━━━━━━",
-                      f"{pei} <b>💼 Unified Portfolio (Compounded · $10,000)</b>",
-                      f"  💰 Total Return: {port['return_pct']:+.2f}%",
-                      f"  🏦 Final Balance: ${port['final_balance']:,.2f}",
-                      f"  📉 Max DD:       {port['max_dd_pct']:.2f}%",
-                      f"  ⚖️ Sharpe:       {port['sharpe']:.3f}",
-                      f"  📊 Trade Legs:   {port['total_legs']}  ({port['win_legs']}W/{port['loss_legs']}L)",
-                      f"  🎯 Win Rate:     {port['win_rate_pct']:.1f}%"]
-        lines += ["━━━━━━━━━━━━━━━━━━━━", "<i>🎖️ Ramos 360 Ai — Telegram-safe report</i>"]
+            lines += [
+                f"{pei} <b>💼 Unified Portfolio</b>   <i>(Compounded · $10,000 start)</i>",
+                f"   💰 <b>Total Return:</b> {port['return_pct']:+.2f}%",
+                f"   🏦 <b>Final Balance:</b> <code>${port['final_balance']:,.2f}</code>",
+                f"   📉 <b>Max Drawdown:</b> {port['max_dd_pct']:.2f}%",
+                f"   ⚖️ <b>Sharpe Ratio:</b> {port['sharpe']:.3f}",
+                f"   📊 <b>Trade Legs:</b> {port['total_legs']}   ({port['win_legs']}W / {port['loss_legs']}L)",
+                f"   🎯 <b>Win Rate:</b> {port['win_rate_pct']:.1f}%",
+                DIV,
+            ]
+
+        lines += ["<i>🎖️ Ramos 360 Ai — Telegram-safe report</i>"]
         return "\n".join(lines)
 
 
@@ -2092,8 +2128,8 @@ def send_telegram(text: str,
 
 async def _main():
     e = BacktestEngine()
-    r = await e.run(symbols=["BTC/USDT:USDT","ETH/USDT:USDT","XRP/USDT:USDT","SOL/USDT:USDT",
-                             "LINK/USDT:USDT","DOGE/USDT:USDT","AVAX/USDT:USDT","NEAR/USDT:USDT",
+    r = await e.run(symbols=["BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT",
+                             "LINK/USDT:USDT","DOGE/USDT:USDT",
                              "XAUUSD","XAGUSD","SPX","NDX"],
                     timeframe="1h", start="2026-01-01", end="2026-05-01", balance=10_000.0)
     report = e.format_report(r)
