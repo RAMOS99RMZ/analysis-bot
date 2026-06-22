@@ -25,7 +25,8 @@ PHILOSOPHY (كما هي + MTF):
 ══════════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
-import asyncio
+import asyncio, os, json, time
+from urllib import request as _urlrequest, error as _urlerror
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
@@ -1995,14 +1996,103 @@ class BacktestEngine:
         return "\n".join(lines)
 
 
+# ══════════════════════════════════════════════════════════════════════════════════
+# 📡 Telegram Delivery — anti-4096 smart splitter (السبب الجذري لعدم وصول الرسالة)
+# ══════════════════════════════════════════════════════════════════════════════════
+# Telegram يرفض أي رسالة أطول من 4096 حرفاً (HTTP 400 "message is too long")، ومع 12
+# عملة أصبح التقرير أطول من هذا الحدّ ⇒ لم تصل الرسالة. الحلّ: تقسيم ذكي للتقرير على
+# حدود الأقسام/العملات مع الحفاظ على وسوم HTML سليمة، وإرسال كل جزء على حدة.
+TELEGRAM_SAFE_LIMIT = 3900  # هامش أمان دون 4096 (يشمل ترويسة الجزء + رموز HTML)
+
+
+def split_for_telegram(text: str, limit: int = TELEGRAM_SAFE_LIMIT) -> List[str]:
+    """تقسيم التقرير إلى أجزاء ≤ limit دون كسر أي سطر/وسم HTML.
+    يفضّل القطع عند الأسطر الفاصلة (الفراغات أو خطوط ━) لإبقاء كل عملة في جزء واحد."""
+    text = text or ""
+    if len(text) <= limit:
+        return [text]
+    # حجز مساحة لترويسة الجزء "📨 Part k/n" التي تُضاف لاحقاً
+    eff = max(512, limit - 40)
+    lines = text.split("\n")
+    chunks: List[str] = []
+    buf: List[str] = []
+    buf_len = 0
+    for ln in lines:
+        add_len = len(ln) + (1 if buf else 0)
+        # لو السطر وحده أطول من الحدّ (نادر) ⇒ قسّمه بالقوة
+        if len(ln) > eff:
+            if buf:
+                chunks.append("\n".join(buf)); buf, buf_len = [], 0
+            for i in range(0, len(ln), eff):
+                chunks.append(ln[i:i + eff])
+            continue
+        if buf_len + add_len > eff:
+            chunks.append("\n".join(buf)); buf, buf_len = [], 0
+            add_len = len(ln)
+        buf.append(ln); buf_len += add_len
+    if buf:
+        chunks.append("\n".join(buf))
+    # ترويسة جزء (k/n) لكل رسالة لإبقائها احترافية ومرتّبة
+    n = len(chunks)
+    if n > 1:
+        chunks = [f"<i>📨 Part {i + 1}/{n}</i>\n{c}" for i, c in enumerate(chunks)]
+    return chunks
+
+
+def send_telegram(text: str,
+                  token: Optional[str] = None,
+                  chat_id: Optional[str] = None,
+                  parse_mode: str = "HTML") -> bool:
+    """إرسال التقرير إلى تليجرام مقسّماً تلقائياً (بدون أي مكتبات خارجية).
+    يقرأ المفاتيح من متغيرات البيئة إن لم تُمرَّر:
+        TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID."""
+    token = token or os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        logger.warning("[Telegram] BOT_TOKEN/CHAT_ID غير متوفرين — تم تخطّي الإرسال.")
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    ok_all = True
+    parts = split_for_telegram(text)
+    for idx, part in enumerate(parts):
+        payload = json.dumps({
+            "chat_id": chat_id,
+            "text": part,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }).encode("utf-8")
+        req = _urlrequest.Request(url, data=payload,
+                                  headers={"Content-Type": "application/json"})
+        try:
+            with _urlrequest.urlopen(req, timeout=30) as resp:
+                resp.read()
+            logger.info(f"[Telegram] أُرسل الجزء {idx + 1}/{len(parts)} ✅")
+        except _urlerror.HTTPError as exc:
+            body = exc.read().decode("utf-8", "ignore")
+            logger.error(f"[Telegram] فشل الجزء {idx + 1}/{len(parts)} "
+                         f"[{exc.code}]: {body}")
+            ok_all = False
+        except Exception as exc:  # شبكة/مهلة
+            logger.error(f"[Telegram] خطأ إرسال الجزء {idx + 1}/{len(parts)}: {exc}")
+            ok_all = False
+        if idx < len(parts) - 1:
+            time.sleep(0.6)  # تجنّب حدود المعدّل (rate limit) بين الأجزاء
+    return ok_all
+
+
 async def _main():
     e = BacktestEngine()
     r = await e.run(symbols=["BTC/USDT:USDT","ETH/USDT:USDT","XRP/USDT:USDT","SOL/USDT:USDT",
                              "LINK/USDT:USDT","DOGE/USDT:USDT","AVAX/USDT:USDT","NEAR/USDT:USDT",
                              "XAUUSD","XAGUSD","SPX","NDX"],
                     timeframe="1h", start="2026-01-01", end="2026-05-01", balance=10_000.0)
-    print("\n" + e.format_report(r).replace("<b>","").replace("</b>","")
+    report = e.format_report(r)
+    # عرض في الطرفية (نصّ نظيف بدون وسوم)
+    print("\n" + report.replace("<b>","").replace("</b>","")
           .replace("<i>","").replace("</i>",""))
+    # إرسال احترافي إلى تليجرام (مقسّم تلقائياً لتجاوز حدّ 4096)
+    if os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
+        send_telegram(report)
 
 
 if __name__ == "__main__":
