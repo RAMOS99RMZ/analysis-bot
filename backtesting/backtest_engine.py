@@ -306,7 +306,8 @@ def _add_div(df: pd.DataFrame, k: int = 3) -> pd.DataFrame:
                 if b[1] > a[1] and b[2] < a[2]:   sc.iloc[i] -= 1.0
                 elif b[1] < a[1] and b[2] > a[2]: sc.iloc[i] -= 0.5
     # آخر إشارة غير صفرية ضمن نافذة k+2 (decay آمن)
-    raw = sc.replace(0, pd.NA).ffill(limit=k + 2).fillna(0)
+    # استخدام where بدل replace(..., pd.NA) حتى لا يتحول النوع إلى object وتظهر FutureWarning في pandas.
+    raw = sc.where(sc.ne(0.0)).ffill(limit=k + 2).fillna(0.0)
     df["div_sc"] = raw.astype(float).clip(-1.5, 1.5)
     return df
 
@@ -1938,53 +1939,42 @@ class BacktestEngine:
         tf = next((v.get("tf","1H") for v in results.values() if isinstance(v, dict) and "tf" in v), "1H")
         mtf = next((v.get("mtf","—") for v in results.values() if isinstance(v, dict) and "mtf" in v), "—")
         period = next((v.get("period","") for v in results.values() if isinstance(v, dict) and "period" in v), "")
-        lines = ["📈 <b>Backtest — Ramos 360 Ai 🎖️  ELITE v11 (Tri-Engine: Crypto + Alts + Macro)</b>",
-                 f"📅 Period: {period}",
-                 f"⏱️ Timeframe: {tf.upper()} | HTF Bias: {mtf.upper()} | Multi-School Confluence",
-                 "✅ Causal (no look-ahead) + Fees/Slippage + Scaled TP1/TP2/TP3 + MTF Filter",
-                 "🎯 Engines: ELITE v8 (BTC/ETH) · ALT-Q v10 (XRP/SOL/LINK/…) · MACRO-Q v11 (XAU/XAG/SPX/NDX)",
-                 "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        lines = ["📈 <b>Backtest — Ramos 360 Ai 🎖️ ELITE v13</b>",
+                 f"📅 <b>Period:</b> {period}",
+                 f"⏱️ <b>TF:</b> {tf.upper()} | <b>HTF:</b> {mtf.upper()} | Tri-Engine + Portfolio",
+                 "✅ Causal · Fees/Slippage · TP1/TP2/TP3 · MTF",
+                 "━━━━━━━━━━━━━━━━━━━━"]
         agg = {"total":0,"wins":0,"losses":0,"ret":0.0,"tp1":0,"tp2":0,"tp3":0,"sl":0}
+        valid_count = 0
         for sym, r in results.items():
             disp = r.get("display", sym) if isinstance(r, dict) else sym
             if "error" in r:
                 lines.append(f"❌ {disp}: {r['error']}"); continue
+            valid_count += 1
             ei = "🟢" if r.get("return_pct", 0) > 0 else "🔴"
-            ex = " ".join(f"{k}:{v}" for k, v in r.get("exit_breakdown", {}).items())
-            ss = " ".join(f"{k}:{v}" for k, v in r.get("session_breakdown", {}).items())
             tph = r.get("tp_hits", {})
+            exits = r.get("exit_breakdown", {})
             agg["total"] += r.get("total",0); agg["wins"] += r.get("wins",0); agg["losses"] += r.get("losses",0)
             agg["ret"] += r.get("return_pct",0)
             agg["tp1"] += tph.get("TP1",0); agg["tp2"] += tph.get("TP2",0); agg["tp3"] += tph.get("TP3",0)
-            agg["sl"]  += r.get("exit_breakdown",{}).get("SL",0)
-            lines += ["", f"{ei} <b>{disp}</b>  · <i>{r.get('engine','—')}</i>",
-                      f"  📊 {r['total']} trades  ({r.get('wins',0)}W/{r.get('losses',0)}L)",
-                      f"  🎯 Win Rate:   {r['win_rate_pct']:.1f}%",
-                      f"  💰 Return:     {r.get('return_pct',0):+.2f}%",
-                      f"  📈 Profit Factor: {r.get('profit_factor',0)}",
-                      f"  🎲 Avg R:      {r.get('avg_r',0):+.3f}R",
-                      f"  📉 Max DD:     {r.get('max_dd_pct',0):.2f}%",
-                      f"  ⚖️ Sharpe:     {r.get('sharpe',0):.3f}",
-                      f"  🔮 Expectancy: {r.get('expectancy',0):+.3f}%",
-                      f"  🏦 Balance:    ${r.get('final_balance',10000):,.2f}",
-                      f"  🏁 Targets:    TP1:{tph.get('TP1',0)} TP2:{tph.get('TP2',0)} TP3:{tph.get('TP3',0)}",
-                      f"  📋 Exits:      {ex}",
-                      f"  🕐 Sessions:   {ss}"]
+            agg["sl"]  += exits.get("SL",0)
+            lines += [f"{ei} <b>{disp}</b> · {r.get('engine','—')} | {r['total']}T ({r.get('wins',0)}W/{r.get('losses',0)}L) | WR {r['win_rate_pct']:.1f}% | Ret {r.get('return_pct',0):+.2f}%",
+                      f"   PF {r.get('profit_factor',0)} · DD {r.get('max_dd_pct',0):.2f}% · TP {tph.get('TP1',0)}/{tph.get('TP2',0)}/{tph.get('TP3',0)} · SL {exits.get('SL',0)} · Bal ${r.get('final_balance',10000):,.0f}"]
         # Aggregate
         if agg["total"] > 0:
             wr_agg = (agg["wins"]/agg["total"]*100) if agg["total"] else 0
-            lines += ["━━━━━━━━━━━━━━━━━━━━━━━━",
+            lines += ["━━━━━━━━━━━━━━━━━━━━",
                       "🧮 <b>Aggregate (All Symbols)</b>",
                       f"  📊 Total Trades: {agg['total']}  ({agg['wins']}W/{agg['losses']}L)",
                       f"  🎯 Win Rate:     {wr_agg:.1f}%",
-                      f"  💰 Avg Return:   {agg['ret']/max(1,len([r for r in results.values() if 'error' not in r])):+.2f}%",
+                      f"  💰 Avg Return:   {agg['ret']/max(1, valid_count):+.2f}%",
                       f"  🏁 Targets:      TP1:{agg['tp1']} TP2:{agg['tp2']} TP3:{agg['tp3']}  |  SL:{agg['sl']}"]
 
         # ── Unified Compounding Portfolio ──
         port = simulate_portfolio(results, initial=10_000.0)
         if "error" not in port:
             pei = "🟢" if port["return_pct"] > 0 else "🔴"
-            lines += ["━━━━━━━━━━━━━━━━━━━━━━━━",
+            lines += ["━━━━━━━━━━━━━━━━━━━━",
                       f"{pei} <b>💼 Unified Portfolio (Compounded · $10,000)</b>",
                       f"  💰 Total Return: {port['return_pct']:+.2f}%",
                       f"  🏦 Final Balance: ${port['final_balance']:,.2f}",
@@ -1992,7 +1982,7 @@ class BacktestEngine:
                       f"  ⚖️ Sharpe:       {port['sharpe']:.3f}",
                       f"  📊 Trade Legs:   {port['total_legs']}  ({port['win_legs']}W/{port['loss_legs']}L)",
                       f"  🎯 Win Rate:     {port['win_rate_pct']:.1f}%"]
-        lines += ["━━━━━━━━━━━━━━━━━━━━━━━━", "<i>🎖️ Ramos 360 Ai — ELITE v11 (Tri-Engine + Portfolio)</i>"]
+        lines += ["━━━━━━━━━━━━━━━━━━━━", "<i>🎖️ Ramos 360 Ai — Telegram-safe report</i>"]
         return "\n".join(lines)
 
 
@@ -2002,17 +1992,16 @@ class BacktestEngine:
 # Telegram يرفض أي رسالة أطول من 4096 حرفاً (HTTP 400 "message is too long")، ومع 12
 # عملة أصبح التقرير أطول من هذا الحدّ ⇒ لم تصل الرسالة. الحلّ: تقسيم ذكي للتقرير على
 # حدود الأقسام/العملات مع الحفاظ على وسوم HTML سليمة، وإرسال كل جزء على حدة.
-TELEGRAM_SAFE_LIMIT = 3900  # هامش أمان دون 4096 (يشمل ترويسة الجزء + رموز HTML)
+TELEGRAM_SAFE_LIMIT = 3300  # هامش أمان كبير دون 4096 حتى لو أضاف notifier خارجي ترويسة/تنسيق
 
 
 def split_for_telegram(text: str, limit: int = TELEGRAM_SAFE_LIMIT) -> List[str]:
-    """تقسيم التقرير إلى أجزاء ≤ limit دون كسر أي سطر/وسم HTML.
-    يفضّل القطع عند الأسطر الفاصلة (الفراغات أو خطوط ━) لإبقاء كل عملة في جزء واحد."""
+    """تقسيم التقرير إلى أجزاء قصيرة وآمنة لتليجرام دون كسر الأسطر أو وسوم HTML."""
     text = text or ""
     if len(text) <= limit:
         return [text]
     # حجز مساحة لترويسة الجزء "📨 Part k/n" التي تُضاف لاحقاً
-    eff = max(512, limit - 40)
+    eff = max(512, limit - 64)
     lines = text.split("\n")
     chunks: List[str] = []
     buf: List[str] = []
@@ -2039,6 +2028,20 @@ def split_for_telegram(text: str, limit: int = TELEGRAM_SAFE_LIMIT) -> List[str]
     return chunks
 
 
+def _env_first(*names: str) -> Optional[str]:
+    """أول متغير بيئة موجود؛ يدعم أسماء الأسرار الشائعة في GitHub Actions."""
+    for name in names:
+        val = os.getenv(name)
+        if val:
+            return val
+    return None
+
+
+def _strip_html_tags(text: str) -> str:
+    """نسخة احتياطية plain text إذا رفض Telegram parse_mode=HTML لأي سبب."""
+    return (text or "").replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
+
+
 def send_telegram(text: str,
                   token: Optional[str] = None,
                   chat_id: Optional[str] = None,
@@ -2046,8 +2049,8 @@ def send_telegram(text: str,
     """إرسال التقرير إلى تليجرام مقسّماً تلقائياً (بدون أي مكتبات خارجية).
     يقرأ المفاتيح من متغيرات البيئة إن لم تُمرَّر:
         TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID."""
-    token = token or os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+    token = token or _env_first("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN", "BOT_TOKEN")
+    chat_id = chat_id or _env_first("TELEGRAM_CHAT_ID", "TG_CHAT_ID", "CHAT_ID")
     if not token or not chat_id:
         logger.warning("[Telegram] BOT_TOKEN/CHAT_ID غير متوفرين — تم تخطّي الإرسال.")
         return False
@@ -2055,25 +2058,32 @@ def send_telegram(text: str,
     ok_all = True
     parts = split_for_telegram(text)
     for idx, part in enumerate(parts):
-        payload = json.dumps({
-            "chat_id": chat_id,
-            "text": part,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }).encode("utf-8")
-        req = _urlrequest.Request(url, data=payload,
-                                  headers={"Content-Type": "application/json"})
-        try:
-            with _urlrequest.urlopen(req, timeout=30) as resp:
-                resp.read()
-            logger.info(f"[Telegram] أُرسل الجزء {idx + 1}/{len(parts)} ✅")
-        except _urlerror.HTTPError as exc:
-            body = exc.read().decode("utf-8", "ignore")
-            logger.error(f"[Telegram] فشل الجزء {idx + 1}/{len(parts)} "
-                         f"[{exc.code}]: {body}")
-            ok_all = False
-        except Exception as exc:  # شبكة/مهلة
-            logger.error(f"[Telegram] خطأ إرسال الجزء {idx + 1}/{len(parts)}: {exc}")
+        sent = False
+        for attempt, mode in enumerate((parse_mode, None), start=1):
+            msg = part if mode else _strip_html_tags(part)
+            payload_dict = {"chat_id": chat_id, "text": msg, "disable_web_page_preview": True}
+            if mode:
+                payload_dict["parse_mode"] = mode
+            payload = json.dumps(payload_dict, ensure_ascii=False).encode("utf-8")
+            req = _urlrequest.Request(url, data=payload,
+                                      headers={"Content-Type": "application/json"})
+            try:
+                with _urlrequest.urlopen(req, timeout=30) as resp:
+                    resp.read()
+                logger.info(f"[Telegram] أُرسل الجزء {idx + 1}/{len(parts)} ✅")
+                sent = True
+                break
+            except _urlerror.HTTPError as exc:
+                body = exc.read().decode("utf-8", "ignore")
+                logger.error(f"[Telegram] فشل الجزء {idx + 1}/{len(parts)} محاولة {attempt} "
+                             f"[{exc.code}]: {body}")
+                # إذا كانت المشكلة HTML فقط، جرّب مباشرة plain text. أما message too long فهي لن تحدث بسبب التقسيم.
+                if mode is None or "message is too long" in body.lower():
+                    break
+            except Exception as exc:  # شبكة/مهلة
+                logger.error(f"[Telegram] خطأ إرسال الجزء {idx + 1}/{len(parts)}: {exc}")
+                break
+        if not sent:
             ok_all = False
         if idx < len(parts) - 1:
             time.sleep(0.6)  # تجنّب حدود المعدّل (rate limit) بين الأجزاء
@@ -2091,8 +2101,9 @@ async def _main():
     print("\n" + report.replace("<b>","").replace("</b>","")
           .replace("<i>","").replace("</i>",""))
     # إرسال احترافي إلى تليجرام (مقسّم تلقائياً لتجاوز حدّ 4096)
-    if os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
-        send_telegram(report)
+    if _env_first("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN", "BOT_TOKEN") and _env_first("TELEGRAM_CHAT_ID", "TG_CHAT_ID", "CHAT_ID"):
+        if not send_telegram(report):
+            logger.error("[Telegram] لم يتم إرسال التقرير بالكامل — راجع رسائل الخطأ أعلاه.")
 
 
 if __name__ == "__main__":
