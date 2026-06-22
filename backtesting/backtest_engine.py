@@ -305,8 +305,7 @@ def _add_div(df: pd.DataFrame, k: int = 3) -> pd.DataFrame:
                 if b[1] > a[1] and b[2] < a[2]:   sc.iloc[i] -= 1.0
                 elif b[1] < a[1] and b[2] > a[2]: sc.iloc[i] -= 0.5
     # آخر إشارة غير صفرية ضمن نافذة k+2 (decay آمن)
-    # pandas >= 2.2: تجنّب FutureWarning الخاص بالـ downcasting بدون تغيير المنطق.
-    raw = sc.mask(sc.eq(0)).ffill(limit=k + 2).fillna(0).infer_objects(copy=False)
+    raw = sc.replace(0, pd.NA).ffill(limit=k + 2).fillna(0)
     df["div_sc"] = raw.astype(float).clip(-1.5, 1.5)
     return df
 
@@ -892,18 +891,7 @@ def zigzag_dev(df: pd.DataFrame, atr_mult: float = 2.2) -> List[Tuple[int, float
 
 
 def _confirmed(piv, i: int) -> List[Tuple[int, float, str]]:
-    # Idempotent: accepts both raw 4-tuples (idx, price, kind, confirm_idx)
-    # and already-confirmed 3-tuples (idx, price, kind). Prevents
-    # IndexError when called twice in a row (e.g. macro engine path).
-    out = []
-    for p in piv:
-        if len(p) >= 4:
-            if p[3] <= i:
-                out.append((p[0], p[1], p[2]))
-        elif len(p) == 3:
-            if p[0] <= i:
-                out.append((p[0], p[1], p[2]))
-    return out
+    return [(p[0], p[1], p[2]) for p in piv if p[3] <= i]
 
 
 def _ratio(a, b):
@@ -1198,59 +1186,6 @@ def sim_alt(df: pd.DataFrame, cfg: AltConfig, balance: float = 10_000.0, df_mtf=
 # BTC/ETH (ELITE v8) and Alt (ALT-Q v10) engines are NOT touched.
 # ══════════════════════════════════════════════════════════════════════════════════
 
-# User-preferred Fibonacci ratios for the MacroQuant engine (Gold/Silver/SPX/NDX).
-# Deep retracements (0.809 / 0.75)  → preferred SL anchors (room for noise).
-# Shallow retracements (0.4045 / 0.309) → preferred TP1 / partial-take levels.
-MACRO_FIB_PREF: List[float] = [0.309, 0.4045, 0.75, 0.809]
-MACRO_FIB_SL:   List[float] = [0.75, 0.809]
-MACRO_FIB_TP:   List[float] = [0.309, 0.4045]
-
-
-def macro_sl_tp(price, direction, sl_anchor, atr, cfg, df, i,
-                hi_sw: float = None, lo_sw: float = None):
-    """
-    Macro SL/TP that respects user-preferred Fibonacci ratios.
-    Falls back to alt_sl_tp logic if no valid swing range is provided.
-    SL  → snaps to nearest deep fib (0.75 / 0.809) of the active swing range.
-    TPs → TP1 uses fib-extension (1 + 0.4045), TP2 (1 + 0.75), TP3 (1 + 1.272).
-    """
-    base = alt_sl_tp(price, direction, sl_anchor, atr, cfg, df, i)
-    if not base:
-        return None
-    sl, sl_d, tp1, tp2, tp3 = base
-    try:
-        if hi_sw is not None and lo_sw is not None and hi_sw > lo_sw:
-            rng = hi_sw - lo_sw
-            if direction == "LONG":
-                cands = [hi_sw - rng * r for r in MACRO_FIB_SL]
-                cands = [c for c in cands if c < price]
-                if cands:
-                    fib_sl = max(cands) - atr * getattr(cfg, "sl_buffer_atr", 0.25)
-                    fib_sl = min(fib_sl, price - atr * getattr(cfg, "sl_atr_min", 1.0))
-                    fib_sl = max(fib_sl, price - atr * getattr(cfg, "sl_atr_max", 3.5))
-                    if fib_sl < price:
-                        sl = fib_sl; sl_d = price - sl
-                tp1 = price + sl_d * (1.0 + MACRO_FIB_TP[1])   # +0.4045 R
-                tp2 = price + sl_d * (1.0 + MACRO_FIB_SL[0])   # +0.75   R
-                tp3 = price + sl_d * (1.0 + 1.272)
-            else:
-                cands = [lo_sw + rng * r for r in MACRO_FIB_SL]
-                cands = [c for c in cands if c > price]
-                if cands:
-                    fib_sl = min(cands) + atr * getattr(cfg, "sl_buffer_atr", 0.25)
-                    fib_sl = max(fib_sl, price + atr * getattr(cfg, "sl_atr_min", 1.0))
-                    fib_sl = min(fib_sl, price + atr * getattr(cfg, "sl_atr_max", 3.5))
-                    if fib_sl > price:
-                        sl = fib_sl; sl_d = sl - price
-                tp1 = price - sl_d * (1.0 + MACRO_FIB_TP[1])
-                tp2 = price - sl_d * (1.0 + MACRO_FIB_SL[0])
-                tp3 = price - sl_d * (1.0 + 1.272)
-    except Exception:
-        pass
-    return round(sl, 6), round(sl_d, 8), round(tp1, 6), round(tp2, 6), round(tp3, 6)
-
-
-
 MACRO_SYMBOLS = {"XAUUSD", "XAGUSD", "SPX", "NDX", "NASDAQ", "GOLD", "SILVER", "ES", "NQ"}
 
 MACRO_YF_MAP = {
@@ -1315,17 +1250,30 @@ class MacroConfig:
     # divergence requirement
     require_div: bool = False
     div_min: float = 0.4
+    # ── Preferred Fibonacci grid (gold/silver/indices) ──
+    # used by macro_sl_tp() for structural stop & target placement.
+    fib_levels: tuple = (0.809, 0.75, 0.4045, 0.0309)
+    # trend-pullback leg (proven elite engine) — vital for trending indices/metals
+    use_trend: bool = True
+    # reversal legs (harmonic/classic/SMC/swing-extreme). Off ⇒ pure trend-following.
+    reversal_enable: bool = True
 
 
 # Per-symbol overrides (tuned for each asset's character)
 MACRO_OVERRIDES: Dict[str, dict] = {
-    "XAUUSD":  {"threshold": 2.1, "er_min": 0.30, "risk_per_trade": 0.014},   # gold trends well
-    "XAGUSD":  {"threshold": 2.4, "er_min": 0.36, "risk_per_trade": 0.011,    # silver noisier
+    # GOLD: combines reversal (harmonic/classic/SMC) + trend pullback. Fib stops via
+    #       preferred grid; trends well so a wider SL cap lets winners breathe.
+    "XAUUSD":  {"reversal_enable": True,  "er_min": 0.32, "sl_atr_max": 3.2,
+                "risk_per_trade": 0.014},
+    # SILVER: noisier — pure trend-following (reversal off) is far cleaner here.
+    "XAGUSD":  {"reversal_enable": False, "er_min": 0.30, "risk_per_trade": 0.013,
                 "max_consec_loss": 2, "dd_breaker": 0.05},
-    "SPX":     {"threshold": 2.0, "er_min": 0.28, "risk_per_trade": 0.014,    # SPX smoother
-                "sl_atr_min": 1.4, "sl_atr_max": 2.6},
-    "NDX":     {"threshold": 2.2, "er_min": 0.32, "risk_per_trade": 0.013,    # NDX more volatile
-                "sl_atr_min": 1.6, "sl_atr_max": 3.0},
+    # INDICES (E-mini ES/NQ): strongly trending → trend-only, looser quality gates
+    #       to admit the few valid 1H pullbacks. Lower risk (fewer, lower-edge setups).
+    "SPX":     {"reversal_enable": False, "er_min": 0.18, "adx_min": 10.0,
+                "sl_atr_min": 1.4, "sl_atr_max": 2.4, "risk_per_trade": 0.012},
+    "NDX":     {"reversal_enable": False, "er_min": 0.18, "adx_min": 10.0,
+                "sl_atr_min": 1.6, "sl_atr_max": 2.4, "risk_per_trade": 0.012},
 }
 
 
@@ -1425,7 +1373,10 @@ def _classic_pattern(z, i: int, price: float, tol: float = 0.025):
     Detect Double Top / Double Bottom / Head & Shoulders (and inverse).
     Returns dict {dir, name, score, anchor} or None. Uses confirmed zigzag pivots only.
     """
-    pts = _confirmed(z, i)
+    # z is already a list of CONFIRMED pivots (idx, price, type) — do NOT
+    # call _confirmed() again (that expects raw 4-tuples and caused
+    # 'tuple index out of range' on every macro symbol).
+    pts = list(z)
     if len(pts) < 4:
         return None
     last = pts[-4:]
@@ -1473,27 +1424,38 @@ def macro_signal(df, z, i, cfg: MacroConfig, df_mtf=None):
 
     candidates = []
 
-    # 1) Harmonic patterns
-    harm = harmonic_at(z, i, price, cfg)
-    if harm:
-        candidates.append((harm["dir"], 2.0, harm["X"], "HARM_" + harm["name"]))
+    if getattr(cfg, "reversal_enable", True):
+        # 1) Harmonic patterns
+        harm = harmonic_at(z, i, price, cfg)
+        if harm:
+            candidates.append((harm["dir"], 2.0, harm["X"], "HARM_" + harm["name"]))
 
-    # 2) Classic patterns (Double Top/Bottom, H&S, Inv H&S)
-    clas = _classic_pattern(z, i, price)
-    if clas:
-        candidates.append((clas["dir"], clas["score"], clas["anchor"], "CLASSIC_" + clas["name"]))
+        # 2) Classic patterns (Double Top/Bottom, H&S, Inv H&S)
+        clas = _classic_pattern(z, i, price)
+        if clas:
+            candidates.append((clas["dir"], clas["score"], clas["anchor"], "CLASSIC_" + clas["name"]))
 
-    # 3) SMC liquidity sweep + premium/discount
-    sm = smc_at(df, z, i, price)
-    if sm:
-        candidates.append((sm["dir"], 0.6 + sm["score"], sm["sl"], "SMC_SWEEP"))
+        # 3) SMC liquidity sweep + premium/discount
+        sm = smc_at(df, z, i, price)
+        if sm:
+            candidates.append((sm["dir"], 0.6 + sm["score"], sm["sl"], "SMC_SWEEP"))
 
-    # 4) Swing-extreme reversal (highest high / lowest low) + reversal candle hint
-    sx = _swing_extreme(df, i, cfg.swing_lookback)
-    if sx == "HH":
-        candidates.append(("SHORT", 1.4, float(row.high), "EXTREME_HH"))
-    elif sx == "LL":
-        candidates.append(("LONG", 1.4, float(row.low),  "EXTREME_LL"))
+        # 4) Swing-extreme reversal (highest high / lowest low) + reversal candle hint
+        sx = _swing_extreme(df, i, cfg.swing_lookback)
+        if sx == "HH":
+            candidates.append(("SHORT", 1.4, float(row.high), "EXTREME_HH"))
+        elif sx == "LL":
+            candidates.append(("LONG", 1.4, float(row.low),  "EXTREME_LL"))
+
+    # 5) Trend-pullback (proven ELITE engine) — trade WITH the trend on
+    #    strongly trending markets (indices/metals); reduces counter-trend losses.
+    if getattr(cfg, "use_trend", True):
+        lb = 50
+        hi_sw = float(df.high.iloc[max(0, i - lb):i + 1].max())
+        lo_sw = float(df.low.iloc[max(0, i - lb):i + 1].min())
+        tdir, tsc, _td = _elite_signal(df, i, hi_sw, lo_sw, _BTCFG, df_mtf=df_mtf)
+        if tdir in ("LONG", "SHORT"):
+            candidates.append((tdir, 2.0, None, "TREND_PB"))
 
     if not candidates:
         return None
@@ -1509,7 +1471,7 @@ def macro_signal(df, z, i, cfg: MacroConfig, df_mtf=None):
             continue
         # Candle / structure
         st_ok, st_sc = _structure_signal(df, i, direction)
-        if not st_ok and not tag.startswith(("HARM", "CLASSIC")):
+        if not st_ok and not tag.startswith(("HARM", "CLASSIC", "TREND")):
             continue
 
         # RSI/OBV divergence bonus (your "golden ratio" momentum confirmation)
@@ -1548,6 +1510,88 @@ def macro_signal(df, z, i, cfg: MacroConfig, df_mtf=None):
         if best is None or total > best["score"]:
             best = cand
     return best
+
+
+# ── PREFERRED FIBONACCI GRID for the MACRO engine ───────────────────────────────
+# المستويات المفضّلة المطلوبة: 0.809 / 0.75 / 0.4045 / 0.0309
+MACRO_FIB = (0.809, 0.75, 0.4045, 0.0309)
+
+
+def macro_sl_tp(price, direction, sl_anchor, atr, cfg: "MacroConfig", df, i):
+    """
+    SL/TP placement for the MACRO engine using the preferred Fibonacci grid
+    (0.809 / 0.75 / 0.4045 / 0.0309) measured on the recent swing range.
+
+      • Deep retracements (0.809 / 0.75)   → structural invalidation → Stop-Loss anchor
+      • Shallow retracements (0.4045/0.0309)→ fib-projection targets blended with R-multiples
+
+    ATR-clamped (sl_atr_min/max) so a fib level never makes the stop absurdly
+    tight or wide. Returns (sl, sl_dist, tp1, tp2, tp3) or None.
+    """
+    lb = max(20, cfg.swing_lookback)
+    hi = float(df.high.iloc[max(0, i - lb):i + 1].max())
+    lo = float(df.low.iloc[max(0, i - lb):i + 1].min())
+    rng = hi - lo
+    buf = atr * cfg.sl_buffer_atr
+    fibs = list(cfg.fib_levels) if getattr(cfg, "fib_levels", None) else list(MACRO_FIB)
+    deep = [r for r in fibs if r >= 0.5]      # 0.809 / 0.75  → stop zone
+    shallow = [r for r in fibs if r < 0.5]    # 0.4045 / 0.0309 → target zone
+
+    if direction == "LONG":
+        # structural stop = below the deepest preferred fib retracement of the swing
+        cands = [hi - rng * r for r in deep if rng > 0 and (hi - rng * r) < price * 0.999]
+        if cands:
+            base = max(cands)
+        elif sl_anchor is not None and sl_anchor < price:
+            base = sl_anchor
+        else:
+            base = float(df.slo14.iloc[i])
+        sl = base - buf
+        sl = min(sl, price - atr * cfg.sl_atr_min)
+        sl = max(sl, price - atr * cfg.sl_atr_max)
+        sl_d = price - sl
+    else:
+        cands = [lo + rng * r for r in deep if rng > 0 and (lo + rng * r) > price * 1.001]
+        if cands:
+            base = min(cands)
+        elif sl_anchor is not None and sl_anchor > price:
+            base = sl_anchor
+        else:
+            base = float(df.shi14.iloc[i])
+        sl = base + buf
+        sl = max(sl, price + atr * cfg.sl_atr_min)
+        sl = min(sl, price + atr * cfg.sl_atr_max)
+        sl_d = sl - price
+
+    if sl_d <= 0:
+        return None
+
+    # Base scaled R-multiple targets (proven), then blend fib projection of the swing.
+    if direction == "LONG":
+        tp1 = price + sl_d * cfg.tp1_r
+        tp2 = price + sl_d * cfg.tp2_r
+        tp3 = price + sl_d * cfg.tp3_r
+        if rng > 0 and shallow:
+            # project the swing range upward by (1 + shallow ratio): a fib-measured move
+            proj = sorted([price + rng * (1.0 + r) for r in shallow])
+            ups = [v for v in proj if v > price * 1.003]
+            if len(ups) >= 1 and ups[0] > tp2:
+                tp2 = ups[0]
+            if len(ups) >= 2 and ups[-1] > tp3:
+                tp3 = ups[-1]
+    else:
+        tp1 = price - sl_d * cfg.tp1_r
+        tp2 = price - sl_d * cfg.tp2_r
+        tp3 = price - sl_d * cfg.tp3_r
+        if rng > 0 and shallow:
+            proj = sorted([price - rng * (1.0 + r) for r in shallow], reverse=True)
+            dns = [v for v in proj if v < price * 0.997]
+            if len(dns) >= 1 and dns[0] < tp2:
+                tp2 = dns[0]
+            if len(dns) >= 2 and dns[-1] < tp3:
+                tp3 = dns[-1]
+
+    return round(sl, 6), round(sl_d, 8), round(tp1, 6), round(tp2, 6), round(tp3, 6)
 
 
 def sim_macro(df: pd.DataFrame, cfg: MacroConfig, balance: float = 10_000.0, df_mtf=None) -> Dict:
@@ -1644,13 +1688,7 @@ def sim_macro(df: pd.DataFrame, cfg: MacroConfig, balance: float = 10_000.0, df_
         sig = macro_signal(df, z, i, cfg, df_mtf=df_mtf)
         if not sig:
             equity.append(balance); continue
-        try:
-            hi_sw = float(row.hh50) if "hh50" in df.columns else None
-            lo_sw = float(row.ll50) if "ll50" in df.columns else None
-        except Exception:
-            hi_sw = lo_sw = None
-        out = macro_sl_tp(price, sig["dir"], sig["sl_anchor"], atr_now, cfg, df, i,
-                          hi_sw=hi_sw, lo_sw=lo_sw)
+        out = macro_sl_tp(price, sig["dir"], sig["sl_anchor"], atr_now, cfg, df, i)
         if not out:
             equity.append(balance); continue
         sl_p, sl_dist, tp1_p, tp2_p, tp3_p = out
@@ -1957,124 +1995,14 @@ class BacktestEngine:
         return "\n".join(lines)
 
 
-def _telegram_plain(text: str) -> str:
-    """Minimal HTML tag stripper for Telegram fallback only."""
-    return (text.replace("<b>", "").replace("</b>", "")
-                .replace("<i>", "").replace("</i>", "")
-                .replace("<u>", "").replace("</u>", ""))
-
-
-def _telegram_chunks(text: str, limit: int = 3900) -> List[str]:
-    """Split Telegram text safely below the 4096-char hard limit.
-
-    Important: the old sender failed after adding XAU/XAG/SPX/NDX because it sent
-    the whole report in one request. This splitter preserves the report and also
-    handles any single overlong line, so Telegram never receives a too-long body.
-    """
-    if not text:
-        return []
-    safe_limit = max(500, min(int(limit), 3900))
-    chunks: List[str] = []
-    buf = ""
-
-    def push(part: str) -> None:
-        nonlocal buf
-        if not part:
-            return
-        while len(part) > safe_limit:
-            head, part = part[:safe_limit], part[safe_limit:]
-            if buf:
-                chunks.append(buf)
-                buf = ""
-            chunks.append(head)
-        if not part:
-            return
-        candidate = f"{buf}\n{part}" if buf else part
-        if len(candidate) <= safe_limit:
-            buf = candidate
-        else:
-            if buf:
-                chunks.append(buf)
-            buf = part
-
-    for line in text.splitlines():
-        push(line)
-    if buf:
-        chunks.append(buf)
-    return chunks
-
-
-async def _send_telegram(html_text: str) -> None:
-    """Send the backtest report to Telegram. Reads env vars:
-       TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (aliases supported)."""
-    import os
-    token = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TG_BOT_TOKEN")
-             or os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN"))
-    chat_id = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_CHAT_ID")
-               or os.getenv("CHAT_ID"))
-    if not token or not chat_id:
-        logger.warning("Telegram disabled: missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars.")
-        return
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    chunks = _telegram_chunks(html_text, limit=3900)
-    if not chunks:
-        logger.warning("Telegram disabled: empty report.")
-        return
-
-    async with httpx.AsyncClient(timeout=30.0) as cli:
-        for i, ch in enumerate(chunks, 1):
-            prefix = f"<b>Part {i}/{len(chunks)}</b>\n" if len(chunks) > 1 else ""
-            body = prefix + ch
-            if len(body) > 4096:
-                # Prefix can push an edge chunk over the limit; split once more safely.
-                extra_parts = _telegram_chunks(ch, limit=3800)
-            else:
-                extra_parts = [ch]
-
-            for j, part in enumerate(extra_parts, 1):
-                sub_prefix = f"<b>Part {i}.{j}/{len(chunks)}</b>\n" if len(extra_parts) > 1 else prefix
-                payload_text = sub_prefix + part
-                try:
-                    resp = await cli.post(url, json={
-                        "chat_id": chat_id,
-                        "text": payload_text,
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    })
-                    if resp.status_code != 200:
-                        # Retry once without HTML parse_mode in case of entity errors.
-                        logger.warning(f"Telegram chunk {i}/{len(chunks)} HTTP {resp.status_code}: {resp.text[:300]}")
-                        plain = _telegram_plain(payload_text)
-                        if len(plain) > 4096:
-                            plain = plain[:4050] + "\n..."
-                        resp2 = await cli.post(url, json={
-                            "chat_id": chat_id,
-                            "text": plain,
-                            "disable_web_page_preview": True,
-                        })
-                        if resp2.status_code != 200:
-                            logger.error(f"Telegram retry failed chunk {i}/{len(chunks)}: {resp2.text[:300]}")
-                        else:
-                            logger.info(f"Telegram sent chunk {i}/{len(chunks)} as plain text ({len(plain)} chars).")
-                    else:
-                        logger.info(f"Telegram sent chunk {i}/{len(chunks)} ({len(payload_text)} chars).")
-                except Exception as ex:
-                    logger.error(f"Telegram send error on chunk {i}/{len(chunks)}: {ex}")
-
-
 async def _main():
     e = BacktestEngine()
     r = await e.run(symbols=["BTC/USDT:USDT","ETH/USDT:USDT","XRP/USDT:USDT","SOL/USDT:USDT",
                              "LINK/USDT:USDT","DOGE/USDT:USDT","AVAX/USDT:USDT","NEAR/USDT:USDT",
                              "XAUUSD","XAGUSD","SPX","NDX"],
                     timeframe="1h", start="2026-01-01", end="2026-05-01", balance=10_000.0)
-    report_html = e.format_report(r)
-    # Console (plain)
-    print("\n" + report_html.replace("<b>","").replace("</b>","")
+    print("\n" + e.format_report(r).replace("<b>","").replace("</b>","")
           .replace("<i>","").replace("</i>",""))
-    # Telegram (HTML, split-safe)
-    await _send_telegram(report_html)
 
 
 if __name__ == "__main__":
