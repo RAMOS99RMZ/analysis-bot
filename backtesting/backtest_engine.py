@@ -1265,46 +1265,49 @@ MACRO_OVERRIDES: Dict[str, dict] = {
     "XAGUSD":  {"reversal_enable": False, "er_min": 0.30, "risk_per_trade": 0.013,
                 "max_consec_loss": 2, "dd_breaker": 0.05},
     # ── INDICES (E-mini ES=SPX / NQ=NDX) ──────────────────────────────────────
-    # Smart "Pro Confluence" profile (Ramos 360 Ai):
-    #   • Hybrid trend-pullback  +  reversal (Harmonic / Classic / SMC / Fib).
-    #   • Momentum divergence REQUIRED  →  rejects weak-impulse entries that
-    #     produced the SPX 20% WR / NQ losing streak in the prior backtest.
-    #   • MTF (4H) strict bias  →  trade only with HTF structure.
-    #   • Tighter risk + DD-breaker  →  small, controlled losses; let trend
-    #     winners (TP2/TP3) compound on E-mini's clean daily drift.
-    #   • Wider chandelier + slightly wider SL cap → survives index noise wicks
-    #     while preferred Fib grid (0.809 / 0.75 / 0.404 / 0.031) anchors stops
-    #     and targets to real market structure.
+    # "Index Momentum-Pullback" profile (Ramos 360 Ai v2):
+    #   • Primary edge = trend-pullback on the dominant HTF drift (indices trend).
+    #   • Reversal engine ON  →  Harmonic / Classic / SMC / Fib  pick swing lows
+    #     and rejection bars at preferred ratios (0.382 / 0.5 / 0.618 / 0.786).
+    #   • Momentum (RSI / MACD / OBV) divergence is a SCORING BONUS, not a hard
+    #     gate  →  keeps trade count healthy (was 0–1 trades when required).
+    #   • MTF (4H) bias is a soft tilt  (bonus/penalty)  rather than veto, so
+    #     range days still produce setups.
+    #   • Filters relaxed to ETH/BTC-style (er_min 0.22 / adx_min 12) which
+    #     historically produced 50+ trades at 73–79% WR.
+    #   • Wider chandelier + Fib grid SL  →  survives index wick noise; TP1/TP2
+    #     book early, TP3 lets the daily drift run.
+    #   • Tight DD breaker + loss decay keep losses small ($100–$150 each).
     "SPX":     {"reversal_enable": True,  "use_trend": True,
-                "er_min": 0.26,  "adx_min": 16.0, "vol_min": 0.8,
-                "threshold": 2.6, "min_rr": 1.45,
-                "require_div": True, "div_min": 0.45,
-                "mtf_strict": True, "mtf_align_bonus": 0.9,
-                "mtf_conflict_penalty": 1.3,
-                "sl_atr_min": 1.6, "sl_atr_max": 2.8,
-                "sl_buffer_atr": 0.22, "chandelier_atr": 2.9,
-                "tp1_r": 1.4, "tp2_r": 2.4, "tp3_r": 4.0,
-                "risk_per_trade": 0.010, "risk_cap": 0.018,
-                "max_consec_loss": 2,
-                "dd_breaker": 0.045, "dd_resume": 0.03,
-                "loss_risk_decay": 0.55,
-                "harmonic_tol": 0.10, "swing_lookback": 80,
-                "max_hold_bars": 72},
+                "er_min": 0.22,  "adx_min": 12.0, "vol_min": 0.70,
+                "threshold": 1.9, "min_rr": 1.20,
+                "require_div": False, "div_min": 0.30,
+                "mtf_strict": False, "mtf_align_bonus": 0.8,
+                "mtf_conflict_penalty": 0.9,
+                "sl_atr_min": 1.4, "sl_atr_max": 3.0,
+                "sl_buffer_atr": 0.20, "chandelier_atr": 3.0,
+                "tp1_r": 1.2, "tp2_r": 2.0, "tp3_r": 3.6,
+                "risk_per_trade": 0.012, "risk_cap": 0.020,
+                "max_consec_loss": 3,
+                "dd_breaker": 0.060, "dd_resume": 0.04,
+                "loss_risk_decay": 0.65,
+                "harmonic_tol": 0.13, "swing_lookback": 70,
+                "max_hold_bars": 96},
     "NDX":     {"reversal_enable": True,  "use_trend": True,
-                "er_min": 0.28,  "adx_min": 16.0, "vol_min": 0.85,
-                "threshold": 2.7, "min_rr": 1.5,
-                "require_div": True, "div_min": 0.45,
-                "mtf_strict": True, "mtf_align_bonus": 0.9,
-                "mtf_conflict_penalty": 1.3,
-                "sl_atr_min": 1.8, "sl_atr_max": 3.0,
-                "sl_buffer_atr": 0.22, "chandelier_atr": 3.0,
-                "tp1_r": 1.5, "tp2_r": 2.6, "tp3_r": 4.2,
-                "risk_per_trade": 0.010, "risk_cap": 0.018,
-                "max_consec_loss": 2,
-                "dd_breaker": 0.045, "dd_resume": 0.03,
-                "loss_risk_decay": 0.55,
-                "harmonic_tol": 0.10, "swing_lookback": 80,
-                "max_hold_bars": 72},
+                "er_min": 0.22,  "adx_min": 12.0, "vol_min": 0.75,
+                "threshold": 1.9, "min_rr": 1.25,
+                "require_div": False, "div_min": 0.30,
+                "mtf_strict": False, "mtf_align_bonus": 0.85,
+                "mtf_conflict_penalty": 0.9,
+                "sl_atr_min": 1.5, "sl_atr_max": 3.2,
+                "sl_buffer_atr": 0.22, "chandelier_atr": 3.2,
+                "tp1_r": 1.25, "tp2_r": 2.2, "tp3_r": 4.0,
+                "risk_per_trade": 0.012, "risk_cap": 0.020,
+                "max_consec_loss": 3,
+                "dd_breaker": 0.060, "dd_resume": 0.04,
+                "loss_risk_decay": 0.65,
+                "harmonic_tol": 0.13, "swing_lookback": 70,
+                "max_hold_bars": 96},
 }
 
 
