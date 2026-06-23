@@ -1264,12 +1264,47 @@ MACRO_OVERRIDES: Dict[str, dict] = {
     # SILVER: noisier — pure trend-following (reversal off) is far cleaner here.
     "XAGUSD":  {"reversal_enable": False, "er_min": 0.30, "risk_per_trade": 0.013,
                 "max_consec_loss": 2, "dd_breaker": 0.05},
-    # INDICES (E-mini ES/NQ): strongly trending → trend-only, looser quality gates
-    #       to admit the few valid 1H pullbacks. Lower risk (fewer, lower-edge setups).
-    "SPX":     {"reversal_enable": False, "er_min": 0.18, "adx_min": 10.0,
-                "sl_atr_min": 1.4, "sl_atr_max": 2.4, "risk_per_trade": 0.012},
-    "NDX":     {"reversal_enable": False, "er_min": 0.18, "adx_min": 10.0,
-                "sl_atr_min": 1.6, "sl_atr_max": 2.4, "risk_per_trade": 0.012},
+    # ── INDICES (E-mini ES=SPX / NQ=NDX) ──────────────────────────────────────
+    # Smart "Pro Confluence" profile (Ramos 360 Ai):
+    #   • Hybrid trend-pullback  +  reversal (Harmonic / Classic / SMC / Fib).
+    #   • Momentum divergence REQUIRED  →  rejects weak-impulse entries that
+    #     produced the SPX 20% WR / NQ losing streak in the prior backtest.
+    #   • MTF (4H) strict bias  →  trade only with HTF structure.
+    #   • Tighter risk + DD-breaker  →  small, controlled losses; let trend
+    #     winners (TP2/TP3) compound on E-mini's clean daily drift.
+    #   • Wider chandelier + slightly wider SL cap → survives index noise wicks
+    #     while preferred Fib grid (0.809 / 0.75 / 0.404 / 0.031) anchors stops
+    #     and targets to real market structure.
+    "SPX":     {"reversal_enable": True,  "use_trend": True,
+                "er_min": 0.26,  "adx_min": 16.0, "vol_min": 0.8,
+                "threshold": 2.6, "min_rr": 1.45,
+                "require_div": True, "div_min": 0.45,
+                "mtf_strict": True, "mtf_align_bonus": 0.9,
+                "mtf_conflict_penalty": 1.3,
+                "sl_atr_min": 1.6, "sl_atr_max": 2.8,
+                "sl_buffer_atr": 0.22, "chandelier_atr": 2.9,
+                "tp1_r": 1.4, "tp2_r": 2.4, "tp3_r": 4.0,
+                "risk_per_trade": 0.010, "risk_cap": 0.018,
+                "max_consec_loss": 2,
+                "dd_breaker": 0.045, "dd_resume": 0.03,
+                "loss_risk_decay": 0.55,
+                "harmonic_tol": 0.10, "swing_lookback": 80,
+                "max_hold_bars": 72},
+    "NDX":     {"reversal_enable": True,  "use_trend": True,
+                "er_min": 0.28,  "adx_min": 16.0, "vol_min": 0.85,
+                "threshold": 2.7, "min_rr": 1.5,
+                "require_div": True, "div_min": 0.45,
+                "mtf_strict": True, "mtf_align_bonus": 0.9,
+                "mtf_conflict_penalty": 1.3,
+                "sl_atr_min": 1.8, "sl_atr_max": 3.0,
+                "sl_buffer_atr": 0.22, "chandelier_atr": 3.0,
+                "tp1_r": 1.5, "tp2_r": 2.6, "tp3_r": 4.2,
+                "risk_per_trade": 0.010, "risk_cap": 0.018,
+                "max_consec_loss": 2,
+                "dd_breaker": 0.045, "dd_resume": 0.03,
+                "loss_risk_decay": 0.55,
+                "harmonic_tol": 0.10, "swing_lookback": 80,
+                "max_hold_bars": 72},
 }
 
 
