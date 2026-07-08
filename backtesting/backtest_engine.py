@@ -766,7 +766,7 @@ def _metrics(sim: Dict, initial: float) -> Dict:
 # Empirically the best of {HARMONIC, SMC, MR, CONFLUENCE} variants → CONFLUENCE (strict).
 # ══════════════════════════════════════════════════════════════════════════════════
 
-ALT_SYMBOLS = {"XRP", "SOL", "LINK", "DOGE", "AVAX", "NEAR"}
+ALT_SYMBOLS = {"SOL", "LINK", "DOGE"}
 
 _HARM = {
     "GARTLEY":   {"AB": (0.55, 0.66), "BC": (0.382, 0.886), "CD": (1.13, 1.618), "AD": (0.74, 0.83)},
@@ -829,15 +829,8 @@ class AltConfig:
 # ── Per-symbol overrides (تُطبَّق فوق AltConfig الافتراضي لكل عملة) ───────────────────
 # XRP = عزل/تصفية صارمة: ضوضاء عالية ⇒ نرفع نقاء الترند + نمنع الدخول عكس الاتجاه + نخفّض المخاطرة.
 ALT_OVERRIDES: Dict[str, dict] = {
-    "XRP":  {"er_min": 0.46, "threshold": 2.4, "trend_block": True, "require_div": False,
-             "div_min": 0.6, "max_consec_loss": 2, "dd_breaker": 0.05, "dd_resume": 0.03,
-             "risk_per_trade": 0.010, "min_rr": 1.25, "vol_min": 0.85},
-    # عملات جديدة عالية السيولة — إعدادات متوازنة (نفس فلسفة SOL/LINK مع حماية ترند)
+    # DOGE — عالية السيولة، إعدادات متوازنة (نفس فلسفة SOL/LINK مع حماية ترند)
     "DOGE": {"er_min": 0.40, "threshold": 2.1, "trend_block": True, "vol_min": 0.8},
-    "AVAX": {"er_min": 0.44, "threshold": 2.3, "trend_block": True, "vol_min": 0.85,
-             "max_consec_loss": 2, "dd_breaker": 0.06},
-    "NEAR": {"er_min": 0.44, "threshold": 2.3, "trend_block": True, "vol_min": 0.85,
-             "max_consec_loss": 2, "dd_breaker": 0.06},
 }
 
 
@@ -1272,44 +1265,50 @@ MACRO_OVERRIDES: Dict[str, dict] = {
                 "max_consec_loss": 2, "dd_breaker": 0.05},
     # INDICES (E-mini ES/NQ): strongly trending → trend-only, looser quality gates
     #       to admit the few valid 1H pullbacks. Lower risk (fewer, lower-edge setups).
-    # ── INDEX ADAPTIVE MOMENTUM v3 (SPX / NDX) ────────────────────────────────
-    # Hybrid: Trend-Pullback + Reversal (Harmonic / Classic / SMC / Fib)
-    #   • Softer ER/ADX/threshold to admit more 1H setups (frequency-first)
-    #   • MTF 4H = soft tilt (bonus/penalty), NOT a strict veto
-    #   • Divergence = scoring bonus, not a hard gate
-    #   • Tighter SL floor + wider TP3 to ride index drift
-    #   • Lower per-trade risk (0.009) + loss-decay 0.60 to protect equity
-    #   • dd_breaker 0.055 / resume 0.035 — early protection w/o killing run
+    # ── INDEX AI-CONFLUENCE v4 (SPX / NDX) ────────────────────────────────────
+    # فلسفة جديدة: الجودة قبل الكمّية — نأخذ صفقات أقل لكن بمعدّل نجاح أعلى.
+    # مبنية على تقاطع مدارس متعدّدة (Harmonic + Classic + SMC + Japanese Candles
+    # + Fibonacci الذهبية 0.809/0.75/0.4045/0.0309) مع احترام صارم للاتجاه الأعلى (4H).
+    #
+    #   • Trend-Pullback + Reversal Confluence  (المؤشرات لا تُطلق الصفقة وحدها)
+    #   • عتبات جودة أعلى (er_min/adx_min/threshold) → تصفية ضوضاء المؤشرات
+    #   • MTF 4H صارم: نمنع التداول عكس البايس إلا لأنماط هارمونيك/كلاسيكي نظيفة
+    #   • Fib grid المفضّلة تُستخدم لتموضع SL/TP بشكل هيكلي
+    #   • R:R أعلى (min_rr 1.4) + tp3 ممتد لركوب سيولة المؤشرات
+    #   • مخاطرة منخفضة (0.008) + loss_decay 0.55 + dd_breaker 0.05
+    #   • harmonic_tol أضيق (0.10) و zz_atr أعلى (2.0) لنماذج أنظف
     "SPX":     {"reversal_enable": True,  "use_trend": True,
-                "er_min": 0.16, "adx_min": 9.0, "vol_min": 0.5,
-                "threshold": 1.75, "min_rr": 1.20,
-                "sl_atr_min": 1.2, "sl_atr_max": 2.6, "sl_buffer_atr": 0.16,
-                "chandelier_atr": 3.0,
-                "tp1_r": 1.2, "tp2_r": 2.2, "tp3_r": 3.8,
-                "tp1_frac": 0.45, "tp2_frac": 0.30,
-                "risk_per_trade": 0.009, "risk_cap": 0.018,
-                "max_consec_loss": 3, "loss_risk_decay": 0.60,
-                "dd_breaker": 0.055, "dd_resume": 0.035,
-                "max_hold_bars": 84, "swing_lookback": 70,
-                "harmonic_tol": 0.14, "zz_atr": 1.7,
-                "mtf_strict": False, "mtf_align_bonus": 0.8,
-                "mtf_conflict_penalty": 0.6,
-                "require_div": False, "div_min": 0.35},
+                "er_min": 0.34, "adx_min": 15.0, "vol_min": 0.75,
+                "threshold": 2.55, "min_rr": 1.40,
+                "sl_atr_min": 1.4, "sl_atr_max": 2.4, "sl_buffer_atr": 0.18,
+                "chandelier_atr": 2.8,
+                "tp1_r": 1.4, "tp2_r": 2.6, "tp3_r": 4.4,
+                "tp1_frac": 0.50, "tp2_frac": 0.30,
+                "risk_per_trade": 0.008, "risk_cap": 0.016,
+                "max_consec_loss": 2, "loss_risk_decay": 0.55,
+                "dd_breaker": 0.05,  "dd_resume": 0.03,
+                "max_hold_bars": 72, "swing_lookback": 80,
+                "harmonic_tol": 0.10, "zz_atr": 2.0,
+                "mtf_strict": True,  "mtf_align_bonus": 1.0,
+                "mtf_conflict_penalty": 1.4,
+                "require_div": False, "div_min": 0.40,
+                "fib_levels": (0.809, 0.75, 0.4045, 0.0309)},
     "NDX":     {"reversal_enable": True,  "use_trend": True,
-                "er_min": 0.16, "adx_min": 9.0, "vol_min": 0.5,
-                "threshold": 1.80, "min_rr": 1.25,
-                "sl_atr_min": 1.3, "sl_atr_max": 2.6, "sl_buffer_atr": 0.16,
-                "chandelier_atr": 3.2,
-                "tp1_r": 1.3, "tp2_r": 2.4, "tp3_r": 4.2,
-                "tp1_frac": 0.45, "tp2_frac": 0.30,
-                "risk_per_trade": 0.009, "risk_cap": 0.018,
-                "max_consec_loss": 3, "loss_risk_decay": 0.60,
-                "dd_breaker": 0.055, "dd_resume": 0.035,
-                "max_hold_bars": 96, "swing_lookback": 70,
-                "harmonic_tol": 0.14, "zz_atr": 1.7,
-                "mtf_strict": False, "mtf_align_bonus": 0.8,
-                "mtf_conflict_penalty": 0.6,
-                "require_div": False, "div_min": 0.35},
+                "er_min": 0.34, "adx_min": 15.0, "vol_min": 0.75,
+                "threshold": 2.60, "min_rr": 1.45,
+                "sl_atr_min": 1.5, "sl_atr_max": 2.4, "sl_buffer_atr": 0.18,
+                "chandelier_atr": 3.0,
+                "tp1_r": 1.5, "tp2_r": 2.8, "tp3_r": 4.8,
+                "tp1_frac": 0.50, "tp2_frac": 0.30,
+                "risk_per_trade": 0.008, "risk_cap": 0.016,
+                "max_consec_loss": 2, "loss_risk_decay": 0.55,
+                "dd_breaker": 0.05,  "dd_resume": 0.03,
+                "max_hold_bars": 80, "swing_lookback": 80,
+                "harmonic_tol": 0.10, "zz_atr": 2.0,
+                "mtf_strict": True,  "mtf_align_bonus": 1.0,
+                "mtf_conflict_penalty": 1.4,
+                "require_div": False, "div_min": 0.40,
+                "fib_levels": (0.809, 0.75, 0.4045, 0.0309)},
 }
 
 
@@ -1855,17 +1854,17 @@ class BacktestEngine:
     async def run(self, symbols: List[str] = None, timeframe: str = "1h", tf: str = None,
                   start: str = "2026-01-01", end: str = "2026-05-01",
                   balance: float = 10_000.0, force_eth: bool = True,
-                  force_xrp: bool = True, force_sol: bool = True,
+                  force_xrp: bool = False, force_sol: bool = True,
                   force_link: bool = True, force_doge: bool = True,
-                  force_avax: bool = True, force_near: bool = True,
+                  force_avax: bool = False, force_near: bool = False,
                   force_xauusd: bool = True, force_xagusd: bool = True,
                   force_spx: bool = True, force_nasdaq: bool = True,
                   **kwargs) -> Dict:
         resolved = tf or timeframe or "1h"
 
         # ── Symbol normalization + auto-add guarantee ──
-        raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT",
-                          "LINK/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "NEAR/USDT:USDT",
+        raw = symbols or ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+                          "LINK/USDT:USDT", "DOGE/USDT:USDT",
                           "XAUUSD", "XAGUSD", "SPX", "NDX"]
         symbols = []
         seen = set()
@@ -1875,12 +1874,9 @@ class BacktestEngine:
                 symbols.append(n); seen.add(n)
         _forced = [
             (force_eth,     "ETH/USDT:USDT"),
-            (force_xrp,     "XRP/USDT:USDT"),
             (force_sol,     "SOL/USDT:USDT"),
             (force_link,    "LINK/USDT:USDT"),
             (force_doge,    "DOGE/USDT:USDT"),
-            (force_avax,    "AVAX/USDT:USDT"),
-            (force_near,    "NEAR/USDT:USDT"),
             (force_xauusd,  "XAUUSD"),
             (force_xagusd,  "XAGUSD"),
             (force_spx,     "SPX"),
@@ -2126,8 +2122,8 @@ def send_telegram(text: str,
 
 async def _main():
     e = BacktestEngine()
-    r = await e.run(symbols=["BTC/USDT:USDT","ETH/USDT:USDT","XRP/USDT:USDT","SOL/USDT:USDT",
-                             "LINK/USDT:USDT","DOGE/USDT:USDT","AVAX/USDT:USDT","NEAR/USDT:USDT",
+    r = await e.run(symbols=["BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT",
+                             "LINK/USDT:USDT","DOGE/USDT:USDT",
                              "XAUUSD","XAGUSD","SPX","NDX"],
                     timeframe="1h", start="2026-01-01", end="2026-05-01", balance=10_000.0)
     report = e.format_report(r)
