@@ -1252,14 +1252,6 @@ class MacroConfig:
     use_trend: bool = True
     # reversal legs (harmonic/classic/SMC/swing-extreme). Off ⇒ pure trend-following.
     reversal_enable: bool = True
-    # ── INDEX AI v5: Golden-Fibonacci Pullback (SPX/NDX) ──
-    # Enables a dedicated trend-with-pullback entry into the 0.4045–0.75 golden zone
-    # of the recent swing, with EMA200-trend + candle confirmation. Off by default;
-    # SPX/NDX overrides enable it. Adds trade count AND win-rate on trending indices.
-    fib_pullback_enable: bool = False
-    fib_pullback_score: float = 1.9
-    fib_zone_low: float = 0.4045
-    fib_zone_high: float = 0.75
 
 
 # Per-symbol overrides (tuned for each asset's character)
@@ -1273,50 +1265,49 @@ MACRO_OVERRIDES: Dict[str, dict] = {
                 "max_consec_loss": 2, "dd_breaker": 0.05},
     # INDICES (E-mini ES/NQ): strongly trending → trend-only, looser quality gates
     #       to admit the few valid 1H pullbacks. Lower risk (fewer, lower-edge setups).
-    # ── INDEX AI v5 (SPX / NDX) — Golden-Fib Pullback + Multi-School Confluence ──
-    # فلسفة v5: صفقات أكثر ونجاح أعلى على 15m/1H/4H.
-    #   • Entry رئيسي: Pullback إلى منطقة فيبوناتشي الذهبية (0.4045–0.75)
-    #     مع اتّجاه EMA200 + شمعة تأكيد (Hammer/Shooting-Star Bullish/Bearish).
-    #   • Confluence: Harmonic + Classic + SMC + Swing-Extreme + Trend-PB.
-    #   • عتبات جودة متوازنة (لا صارمة v4 ولا مفتوحة v3) → تدفّق صفقات صحّي.
-    #   • MTF 4H غير صارم — عقوبة أخفّ + بونص محاذاة أعلى.
-    #   • TP1 قريب/سريع (1.15R × 0.55) لرفع WR فورًا، TP2/TP3 يركبان الاتجاه.
-    #   • Chandelier trailing يحمي الأرباح على 4H.
+    # ── INDEX AI-CONFLUENCE v4 (SPX / NDX) ────────────────────────────────────
+    # فلسفة جديدة: الجودة قبل الكمّية — نأخذ صفقات أقل لكن بمعدّل نجاح أعلى.
+    # مبنية على تقاطع مدارس متعدّدة (Harmonic + Classic + SMC + Japanese Candles
+    # + Fibonacci الذهبية 0.809/0.75/0.4045/0.0309) مع احترام صارم للاتجاه الأعلى (4H).
+    #
+    #   • Trend-Pullback + Reversal Confluence  (المؤشرات لا تُطلق الصفقة وحدها)
+    #   • عتبات جودة أعلى (er_min/adx_min/threshold) → تصفية ضوضاء المؤشرات
+    #   • MTF 4H صارم: نمنع التداول عكس البايس إلا لأنماط هارمونيك/كلاسيكي نظيفة
+    #   • Fib grid المفضّلة تُستخدم لتموضع SL/TP بشكل هيكلي
+    #   • R:R أعلى (min_rr 1.4) + tp3 ممتد لركوب سيولة المؤشرات
+    #   • مخاطرة منخفضة (0.008) + loss_decay 0.55 + dd_breaker 0.05
+    #   • harmonic_tol أضيق (0.10) و zz_atr أعلى (2.0) لنماذج أنظف
     "SPX":     {"reversal_enable": True,  "use_trend": True,
-                "fib_pullback_enable": True, "fib_pullback_score": 1.95,
-                "fib_zone_low": 0.4045, "fib_zone_high": 0.75,
-                "er_min": 0.22, "adx_min": 11.0, "vol_min": 0.55,
-                "threshold": 1.85, "min_rr": 1.20,
-                "sl_atr_min": 1.2, "sl_atr_max": 2.6, "sl_buffer_atr": 0.16,
-                "chandelier_atr": 2.6,
-                "tp1_r": 1.15, "tp2_r": 2.30, "tp3_r": 4.20,
-                "tp1_frac": 0.55, "tp2_frac": 0.30,
-                "risk_per_trade": 0.010, "risk_cap": 0.018,
-                "max_consec_loss": 3, "loss_risk_decay": 0.65,
-                "dd_breaker": 0.06,  "dd_resume": 0.035,
-                "max_hold_bars": 64, "swing_lookback": 70,
-                "harmonic_tol": 0.11, "zz_atr": 1.9,
-                "mtf_strict": False, "mtf_align_bonus": 1.1,
-                "mtf_conflict_penalty": 0.9,
-                "require_div": False, "div_min": 0.35,
+                "er_min": 0.34, "adx_min": 15.0, "vol_min": 0.75,
+                "threshold": 2.55, "min_rr": 1.40,
+                "sl_atr_min": 1.4, "sl_atr_max": 2.4, "sl_buffer_atr": 0.18,
+                "chandelier_atr": 2.8,
+                "tp1_r": 1.4, "tp2_r": 2.6, "tp3_r": 4.4,
+                "tp1_frac": 0.50, "tp2_frac": 0.30,
+                "risk_per_trade": 0.008, "risk_cap": 0.016,
+                "max_consec_loss": 2, "loss_risk_decay": 0.55,
+                "dd_breaker": 0.05,  "dd_resume": 0.03,
+                "max_hold_bars": 72, "swing_lookback": 80,
+                "harmonic_tol": 0.10, "zz_atr": 2.0,
+                "mtf_strict": True,  "mtf_align_bonus": 1.0,
+                "mtf_conflict_penalty": 1.4,
+                "require_div": False, "div_min": 0.40,
                 "fib_levels": (0.809, 0.75, 0.4045, 0.0309)},
     "NDX":     {"reversal_enable": True,  "use_trend": True,
-                "fib_pullback_enable": True, "fib_pullback_score": 2.00,
-                "fib_zone_low": 0.4045, "fib_zone_high": 0.75,
-                "er_min": 0.22, "adx_min": 11.0, "vol_min": 0.55,
-                "threshold": 1.90, "min_rr": 1.20,
-                "sl_atr_min": 1.3, "sl_atr_max": 2.6, "sl_buffer_atr": 0.16,
-                "chandelier_atr": 2.8,
-                "tp1_r": 1.20, "tp2_r": 2.40, "tp3_r": 4.50,
-                "tp1_frac": 0.55, "tp2_frac": 0.30,
-                "risk_per_trade": 0.010, "risk_cap": 0.018,
-                "max_consec_loss": 3, "loss_risk_decay": 0.65,
-                "dd_breaker": 0.06,  "dd_resume": 0.035,
-                "max_hold_bars": 72, "swing_lookback": 70,
-                "harmonic_tol": 0.11, "zz_atr": 1.9,
-                "mtf_strict": False, "mtf_align_bonus": 1.1,
-                "mtf_conflict_penalty": 0.9,
-                "require_div": False, "div_min": 0.35,
+                "er_min": 0.34, "adx_min": 15.0, "vol_min": 0.75,
+                "threshold": 2.60, "min_rr": 1.45,
+                "sl_atr_min": 1.5, "sl_atr_max": 2.4, "sl_buffer_atr": 0.18,
+                "chandelier_atr": 3.0,
+                "tp1_r": 1.5, "tp2_r": 2.8, "tp3_r": 4.8,
+                "tp1_frac": 0.50, "tp2_frac": 0.30,
+                "risk_per_trade": 0.008, "risk_cap": 0.016,
+                "max_consec_loss": 2, "loss_risk_decay": 0.55,
+                "dd_breaker": 0.05,  "dd_resume": 0.03,
+                "max_hold_bars": 80, "swing_lookback": 80,
+                "harmonic_tol": 0.10, "zz_atr": 2.0,
+                "mtf_strict": True,  "mtf_align_bonus": 1.0,
+                "mtf_conflict_penalty": 1.4,
+                "require_div": False, "div_min": 0.40,
                 "fib_levels": (0.809, 0.75, 0.4045, 0.0309)},
 }
 
@@ -1445,63 +1436,6 @@ def _classic_pattern(z, i: int, price: float, tol: float = 0.025):
     return None
 
 
-# ── INDEX AI v5: Golden-Fibonacci Pullback (SPX/NDX) ────────────────────────────
-def _fib_golden_pullback(df, i, cfg: "MacroConfig"):
-    """
-    Detect a high-quality trend-pullback into the preferred golden fib zone
-    (default 0.4045 → 0.75) of the recent swing, aligned with the EMA200 trend
-    and confirmed by a reversal-friendly candle. Returns dict{dir, score, anchor}
-    or None. This is the core generator that lifts SPX/NDX trade count + WR.
-    """
-    if not getattr(cfg, "fib_pullback_enable", False):
-        return None
-    lb = max(30, int(cfg.swing_lookback))
-    if i < lb + 2:
-        return None
-    row = df.iloc[i]
-    price = float(row.close); high = float(row.high); low = float(row.low); op = float(row.open)
-    hi = float(df.high.iloc[i - lb:i + 1].max())
-    lo = float(df.low.iloc[i - lb:i + 1].min())
-    rng = hi - lo
-    if rng <= 0:
-        return None
-    e50 = float(row.e50); e200 = float(row.e200); slope = float(row.e200_slope)
-    zlo = float(getattr(cfg, "fib_zone_low", 0.4045))
-    zhi = float(getattr(cfg, "fib_zone_high", 0.75))
-    base = float(getattr(cfg, "fib_pullback_score", 1.9))
-
-    # bullish body / bearish body helpers
-    body = abs(price - op); rng_c = max(high - low, 1e-9)
-    bull_candle = (price > op) and (body / rng_c >= 0.35)
-    bear_candle = (price < op) and (body / rng_c >= 0.35)
-    # hammer / shooting-star tails (extra confluence)
-    upper_wick = high - max(price, op); lower_wick = min(price, op) - low
-    hammer      = lower_wick >= body * 1.5 and price >= op
-    shooter     = upper_wick >= body * 1.5 and price <= op
-
-    # LONG: uptrend, pullback into golden zone measured from swing-low upward
-    if e50 > e200 and slope > 0.0 and price > e200:
-        z_bot = lo + rng * zlo
-        z_top = lo + rng * zhi
-        # price tagged golden zone recently and is now reclaiming above e50
-        tagged = float(df.low.iloc[i - 3:i + 1].min()) <= z_top and \
-                 float(df.low.iloc[i - 3:i + 1].min()) >= z_bot * 0.995
-        if tagged and price >= e50 * 0.999 and (bull_candle or hammer):
-            score = base + (0.25 if hammer else 0.0)
-            return {"dir": "LONG", "score": score, "anchor": lo + rng * zhi, "name": "FIB_GOLDEN_PB"}
-
-    # SHORT: downtrend, pullback into golden zone measured from swing-high downward
-    if e50 < e200 and slope < 0.0 and price < e200:
-        z_top = hi - rng * zlo
-        z_bot = hi - rng * zhi
-        tagged = float(df.high.iloc[i - 3:i + 1].max()) >= z_bot and \
-                 float(df.high.iloc[i - 3:i + 1].max()) <= z_top * 1.005
-        if tagged and price <= e50 * 1.001 and (bear_candle or shooter):
-            score = base + (0.25 if shooter else 0.0)
-            return {"dir": "SHORT", "score": score, "anchor": hi - rng * zhi, "name": "FIB_GOLDEN_PB"}
-    return None
-
-
 def _swing_extreme(df, i, lookback: int):
     """Detect if current bar prints fresh swing-extreme (HH or LL) over lookback window."""
     if i < lookback:
@@ -1558,13 +1492,6 @@ def macro_signal(df, z, i, cfg: MacroConfig, df_mtf=None):
         if tdir in ("LONG", "SHORT"):
             candidates.append((tdir, 2.0, None, "TREND_PB"))
 
-    # 6) INDEX AI v5 — Golden-Fibonacci Pullback (SPX/NDX only, via cfg flag)
-    fp = _fib_golden_pullback(df, i, cfg)
-    if fp:
-        candidates.append((fp["dir"], fp["score"], fp["anchor"], "FIB_GOLDEN_PB"))
-
-
-
     if not candidates:
         return None
 
@@ -1579,7 +1506,7 @@ def macro_signal(df, z, i, cfg: MacroConfig, df_mtf=None):
             continue
         # Candle / structure
         st_ok, st_sc = _structure_signal(df, i, direction)
-        if not st_ok and not tag.startswith(("HARM", "CLASSIC", "TREND", "FIB_GOLDEN")):
+        if not st_ok and not tag.startswith(("HARM", "CLASSIC", "TREND")):
             continue
 
         # RSI/OBV divergence bonus (your "golden ratio" momentum confirmation)
@@ -1606,7 +1533,7 @@ def macro_signal(df, z, i, cfg: MacroConfig, df_mtf=None):
             if aligned:
                 total += cfg.mtf_align_bonus
             elif conflict:
-                if cfg.mtf_strict and not tag.startswith(("HARM", "CLASSIC", "EXTREME", "FIB_GOLDEN")):
+                if cfg.mtf_strict and not tag.startswith(("HARM", "CLASSIC", "EXTREME")):
                     # allow only strongest reversal patterns to fight 4H bias
                     continue
                 total -= cfg.mtf_conflict_penalty
