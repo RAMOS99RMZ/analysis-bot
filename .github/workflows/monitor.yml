@@ -1,49 +1,21 @@
-name: "🛡️ Monitor — Position Guardian"
-
+name: "👁️ Monitor Positions"
 on:
   schedule:
-    - cron: "* * * * *"
+    - cron: "* * * * *"   # every 1 minute
   workflow_dispatch:
-
 jobs:
   monitor:
-    name: "🔍 Monitor Positions"
     runs-on: ubuntu-latest
-    timeout-minutes: 9
+    timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - run: python -m pip install --upgrade pip
-
-      - name: Install deps
-        run: |
-          grep -v -iE "^pandas" requirements.txt > /tmp/req.txt || true
-          pip install -r /tmp/req.txt
-          pip install "pandas==2.2.2" "pandas-ta-classic"
-
-      - name: Patch pandas_ta
-        run: |
-          python -c "
-          import site, pathlib
-          p = pathlib.Path(site.getsitepackages()[0]) / 'pandas_ta.py'
-          p.write_text('import pandas_ta_classic\nfrom pandas_ta_classic import *\n')
-          print('pandas_ta OK')
-          "
-
-      - name: 🛡️ Run Monitor
+        with: {python-version: "3.11", cache: "pip"}
+      - run: pip install -q httpx pandas loguru
+      - name: Monitor
         env:
-          OKX_KEY:      ${{ secrets.OKX_KEY }}
-          OKX_SECRET:   ${{ secrets.OKX_SECRET }}
-          OKX_PASS:     ${{ secrets.OKX_PASS }}
           BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
           CHAT_ID:      ${{ secrets.CHAT_ID }}
-          GROQ_KEY:     ${{ secrets.GROQ_KEY }}
-          GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: timeout 240 python main.py --mode monitor || true
+        run: python main.py --mode monitor
