@@ -1,7 +1,7 @@
 name: "⚡ Scalp Signals"
 on:
   schedule:
-    - cron: "0 7-16 * * 1-5"   # Every hour 07-16 UTC, weekdays
+    - cron: "0 7-16 * * 1-5"
   workflow_dispatch:
 jobs:
   scalp:
@@ -10,12 +10,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: "3.11", cache: "pip"}
-      - run: pip install -q httpx pandas loguru
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -q httpx pandas loguru python-dotenv
       - name: Scalp
         env:
           BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
           CHAT_ID:      ${{ secrets.CHAT_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LOG_LEVEL:    "INFO"
         run: timeout 480 python main.py --mode scalp || true
