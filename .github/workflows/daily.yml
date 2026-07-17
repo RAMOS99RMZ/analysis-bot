@@ -1,7 +1,7 @@
 name: "📊 Daily Report"
 on:
   schedule:
-    - cron: "0 0 * * *"   # 00:00 UTC daily
+    - cron: "0 0 * * *"
   workflow_dispatch:
 jobs:
   daily:
@@ -10,12 +10,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: "3.11", cache: "pip"}
-      - run: pip install -q httpx pandas loguru
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -q httpx pandas loguru python-dotenv
       - name: Daily Report
         env:
           BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
           CHAT_ID:      ${{ secrets.CHAT_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LOG_LEVEL:    "INFO"
         run: python main.py --mode daily
