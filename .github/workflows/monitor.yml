@@ -14,12 +14,15 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - name: Install dependencies
-        run: pip install -q httpx pandas loguru python-dotenv
+        run: pip install -q httpx pandas loguru python-dotenv ccxt
       - name: Monitor
         env:
           BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
           CHAT_ID:      ${{ secrets.CHAT_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          OKX_KEY:      ${{ secrets.OKX_KEY }}
+          OKX_SECRET:   ${{ secrets.OKX_SECRET }}
+          OKX_PASS:     ${{ secrets.OKX_PASS }}
           LOG_LEVEL:    "INFO"
-        run: python main.py --mode monitor
+        run: python main.py --mode monitor || true
