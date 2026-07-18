@@ -14,7 +14,9 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - name: Install dependencies
-        run: pip install -q httpx pandas loguru python-dotenv ccxt
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
       - name: Scalp
         env:
           BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
@@ -24,5 +26,7 @@ jobs:
           OKX_KEY:      ${{ secrets.OKX_KEY }}
           OKX_SECRET:   ${{ secrets.OKX_SECRET }}
           OKX_PASS:     ${{ secrets.OKX_PASS }}
+          GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
+          GROQ_KEY:     ${{ secrets.GROQ_KEY }}
           LOG_LEVEL:    "INFO"
         run: timeout 480 python main.py --mode scalp || true
