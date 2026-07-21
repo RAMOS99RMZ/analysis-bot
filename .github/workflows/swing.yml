@@ -17,6 +17,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+          python -c "import pandas_ta; print('pandas_ta OK')" || pip install pandas-ta --no-deps
       - name: Swing
         env:
           BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
