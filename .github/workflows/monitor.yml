@@ -14,10 +14,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          python -c "import pandas_ta; print('pandas_ta OK')" || pip install pandas-ta --no-deps
+        run: pip install httpx pandas numpy loguru python-dotenv ccxt aiohttp
       - name: Monitor
         env:
           BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
