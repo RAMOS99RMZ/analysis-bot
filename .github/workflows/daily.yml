@@ -14,7 +14,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - name: Install dependencies
-        run: pip install httpx pandas numpy loguru python-dotenv ccxt aiohttp tenacity
+        run: pip install httpx aiohttp requests pandas numpy loguru python-dotenv ccxt supabase postgrest tenacity python-dateutil pytz
       - name: Daily
         env:
           BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
