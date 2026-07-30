@@ -1,4 +1,3 @@
-
 """
 main.py — Ramos 360 Ai 🎖️
 يُشغَّل من GitHub Actions بـ --mode [monitor|scalp|swing|daily]
