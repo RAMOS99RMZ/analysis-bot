@@ -1,10 +1,28 @@
+# HTTP & Async
 httpx>=0.27.0
+aiohttp>=3.9.0
+requests>=2.31.0
+
+# Data
 pandas>=2.0.0
 numpy>=1.26.0
+
+# Logging
 loguru>=0.7.0
+
+# Environment
 python-dotenv>=1.0.0
+
+# Trading
 ccxt>=4.3.0
-aiohttp>=3.9.0
+
+# Database
+supabase>=2.0.0
+postgrest>=0.16.0
+
+# Retry logic
 tenacity>=8.2.0
+
+# Utils
 python-dateutil>=2.9.0
 pytz>=2024.1
