@@ -1,0 +1,35 @@
+name: "🔍 Debug — Check jobs.py"
+on:
+  workflow_dispatch:
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install httpx aiohttp requests pandas numpy loguru python-dotenv ccxt supabase postgrest tenacity python-dateutil pytz
+      - name: Show jobs.py content
+        run: |
+          echo "=== FILE PATH ==="
+          find . -name "jobs.py" -path "*/scheduler/*"
+          echo ""
+          echo "=== FIRST 5 LINES ==="
+          head -5 scheduler/jobs.py
+          echo ""
+          echo "=== SEARCH FOR job_monitor ==="
+          grep -n "def job_monitor\|job_monitor =" scheduler/jobs.py
+          echo ""
+          echo "=== FILE SIZE ==="
+          wc -l scheduler/jobs.py
+      - name: Debug via Python
+        env:
+          BOT_TOKEN:    ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:      ${{ secrets.CHAT_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python main.py --mode debug || true
