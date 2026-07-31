@@ -1,444 +1,289 @@
-
 """
-scheduler/jobs.py — Ramos 360 Ai 🎖️
-Full Layer Architecture:
-  Layer 1: Market Intelligence (every 4h)
-  Layer 2: Swing Hunter (every 2h, only if L1 non-neutral)
-  Layer 3: Scalp Engine (every 5m, session-filtered + AI pre-filter)
+scheduler/jobs.py — Ramos 360 Ai 🎖️  (FINAL — bulletproof names)
+════════════════════════════════════════════════════════════════
+كل الدوال معرّفة مباشرة بأسمائها الحقيقية — لا توجد aliases معلّقة.
 """
 from __future__ import annotations
-import asyncio
+import asyncio, os
+from datetime import datetime, timezone, timedelta
 from loguru import logger
-from config import CONFIG, Secrets
-from engine.data_fetcher import DataFetcher
-from engine.signal_generator import run_all_assets
-from engine.market_intelligence import run_layer1, get_cached_context
-from engine.session_filter import (
-    is_session_allowed, session_quality_score, calc_dynamic_sl_tp, validate_levels
+
+from engine.live_engine import (
+    get_live_price, get_candles, generate_signal,
+    get_macro_context, calc_size,
+    ALT_SYMBOLS, MACRO_SYMBOLS
 )
-from ai.gemini_prefilter import gemini_market_check
-from ai.confirmation import confirm_signal
-from database import SupabaseLogger
-from notifier import TelegramNotifier
-from utils.helpers import is_circuit_open, make_run_id, get_session
+from engine.state_manager import (
+    load_open_trades, save_trade, close_trade,
+    partial_close_trade, update_trailing_sl,
+    get_account_balance, save_account_balance,
+    get_daily_pnl, count_open_trades_for,
+    monitor_open_trades, _get,
+)
 
-_db:       SupabaseLogger   = None
-_notifier: TelegramNotifier = None
-_fetcher:  DataFetcher      = None
+CRYPTO_SYMBOLS = [
+    "BTC/USDT:USDT", "ETH/USDT:USDT",
+    "SOL/USDT:USDT", "LINK/USDT:USDT",
+    "DOGE/USDT:USDT",
+]
 
-def init(db, notifier, fetcher):
-    global _db, _notifier, _fetcher
-    _db = db; _notifier = notifier; _fetcher = fetcher
+RISK_FRAC    = 0.018
+MAX_OPEN     = 3
+DD_LIMIT_PCT = 12.0
 
 
-# ══════════════════════════════════════════════════════════════════
-# MONITOR POSITIONS — UPDATE existing trades (not insert new)
-# ══════════════════════════════════════════════════════════════════
-async def job_monitor_positions():
-    if is_circuit_open(): return
-    try:
-        open_trades = _db.get_open_trades()
-        if not open_trades:
-            logger.info("[Monitor] No open trades")
-            return
-        logger.info(f"[Monitor] Checking {len(open_trades)} open trades …")
-
-        for trade in open_trades:
-            trade_id  = trade.get("id")
-            symbol    = trade.get("symbol")
-            direction = trade.get("direction")
-            entry     = float(trade.get("entry_price", 0) or 0)
-            sl        = float(trade.get("sl_price",    0) or 0)
-            tp1       = float(trade.get("tp1_price",   0) or 0)
-            tp2       = float(trade.get("tp2_price",   0) or 0)
-            tp3       = float(trade.get("tp3_price",   0) or 0)
-            if not symbol or not entry or not trade_id:
-                continue
-
-            price = await _fetcher.get_live_price(symbol)
-            if not price:
-                continue
-
-            pnl_pct = ((price - entry) / entry * 100) if direction == "LONG" \
-                       else ((entry - price) / entry * 100)
-
-            event = None
-            if direction == "LONG":
-                if sl  and price <= sl:  event = "SL"
-                elif tp3 and price >= tp3: event = "TP3"
-                elif tp2 and price >= tp2: event = "TP2"
-                elif tp1 and price >= tp1: event = "TP1"
-            else:
-                if sl  and price >= sl:  event = "SL"
-                elif tp3 and price <= tp3: event = "TP3"
-                elif tp2 and price <= tp2: event = "TP2"
-                elif tp1 and price <= tp1: event = "TP1"
-
-            if event:
-                new_status = "CLOSED" if event in ("SL","TP3") else event
-                result     = "WIN" if pnl_pct > 0 else "LOSS"
-                try:
-                    await _db.update_trade_status(
-                        trade_id=trade_id,
-                        status=new_status,
-                        exit_price=price,
-                        pnl_pct=round(pnl_pct, 4),
-                    )
-                except Exception as e:
-                    logger.warning(f"[Monitor] DB: {e}")
-
-                try:
-                    await _notifier.send_monitor_alert(
-                        symbol, direction, event, price, pnl_pct
-                    )
-                    logger.info(f"[Monitor] {symbol} {event} @ ${price:.2f} PnL={pnl_pct:+.2f}%")
-                except Exception as e:
-                    logger.error(f"[Monitor] Telegram: {e}")
-
-    except Exception as e:
-        logger.error(f"[Monitor] {e}")
+def _build_signal_msg(sig: dict, trade_type: str = "⚡ Scalp") -> str:
+    sym   = sig.get("symbol_clean", sig.get("symbol", "?"))
+    d     = sig.get("direction", "?")
+    eng   = sig.get("engine", "?")
+    entry = sig.get("entry_price", 0)
+    sl    = sig.get("sl_price", 0)
+    tp1   = sig.get("tp1_price", 0)
+    tp2   = sig.get("tp2_price", 0)
+    tp3   = sig.get("tp3_price", 0)
+    rr    = sig.get("rr", 0)
+    score = sig.get("score", 0)
+    size  = sig.get("size_usdt", 0)
+    icon  = "🟢 LONG" if d == "LONG" else "🔴 SHORT"
+    f = lambda v: f"${v:,.4f}" if v < 1000 else f"${v:,.2f}"
+    return (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{trade_type} · <b>{sym}</b> · [{eng}]\n"
+        f"{icon}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 Entry:  {f(entry)}\n"
+        f"🛑 SL:     {f(sl)}\n"
+        f"🎯 TP1:   {f(tp1)}\n"
+        f"🎯 TP2:   {f(tp2)}\n"
+        f"🎯 TP3:   {f(tp3)}\n"
+        f"⚖️ RR:     {rr:.2f}\n"
+        f"📊 Score:  {score:.3f}\n"
+        f"💰 Size:   ${size:,.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>🎖️ Ramos 360 Ai</i>"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
-# LAYER 1 — Market Intelligence (every 4h)
+# ✅ job_monitor — DEFINED DIRECTLY (not an alias)
 # ══════════════════════════════════════════════════════════════════
-async def job_run_layer1():
-    """Layer 1: Wyckoff + Gann + William%R + USDT.D analysis."""
-    logger.info("[L1] 🧠 Starting Market Intelligence …")
-    try:
-        ctx = await run_layer1(_db)
-
-        btc = ctx.get("BTC", {})
-        eth = ctx.get("ETH", {})
-        macro = ctx.get("macro", {})
-        overall = ctx.get("overall_bias", "NEUTRAL")
-
-        msg = (
-            f"🧠 <b>Layer 1 — Market Intelligence</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"₿ BTC: <b>{btc.get('bias','?')}</b>"
-            f" | Wyckoff: {btc.get('wyckoff',{}).get('phase','?')}\n"
-            f"Ξ ETH: <b>{eth.get('bias','?')}</b>"
-            f" | Wyckoff: {eth.get('wyckoff',{}).get('phase','?')}\n"
-            f"📡 USDT.D: {macro.get('usdt_d','?')}%"
-            f" → {macro.get('crypto_bias','?')}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏁 Overall: <b>{overall}</b>\n"
-            f"⚡ Scalp: {'✅ مسموح' if ctx.get('scalp_allowed') else '🚫 محظور'}\n"
-            f"🌊 Swing: {'✅ مسموح' if ctx.get('swing_allowed') else '🚫 محظور'}\n"
-            f"<i>🎖️ Ramos 360 Ai — Layer 1</i>"
-        )
-        await _notifier.send(msg)
-        logger.success("[L1] ✅ Done")
-
-    except Exception as e:
-        logger.error(f"[L1] {e}")
-        try:
-            await _notifier.send_error("LAYER1", str(e))
-        except Exception:
-            pass
-
-
-# ══════════════════════════════════════════════════════════════════
-# CORE PIPELINE — used by Layer 2 (Swing) and Layer 3 (Scalp)
-# ══════════════════════════════════════════════════════════════════
-async def _run_pipeline(run_tag: str, trade_type: str):
-    """
-    Unified signal pipeline with:
-    1. Layer 1 context check
-    2. Session filter (Scalp only)
-    3. Gemini pre-filter (Scalp only)
-    4. Signal generation with ATR dynamic SL
-    5. AI confirmation
-    6. Telegram + DB
-    """
-    if is_circuit_open():
-        logger.warning(f"[{run_tag}] Circuit breaker OPEN — skipping")
+async def job_monitor(notifier=None):
+    """Runs every 1 minute. Checks all open trades for SL/TP hits."""
+    logger.info("[Monitor] 🔍 Checking open trades …")
+    result = await monitor_open_trades(get_price_fn=get_live_price)
+    if not result["updates"]:
+        logger.info(f"[Monitor] ✅ No changes. {result['checked']} trades active.")
         return
-
-    run_id  = make_run_id(run_tag)
-    session = get_session()
-    is_scalp = trade_type in ("Scalp", "QuickScalp")
-
-    # ── Step 1: Layer 1 Context Check ────────────────────────────
-    l1_ctx = get_cached_context()
-    if l1_ctx:
-        overall_bias = l1_ctx.get("overall_bias", "NEUTRAL")
-        scalp_ok     = l1_ctx.get("scalp_allowed", True)
-        swing_ok     = l1_ctx.get("swing_allowed", True)
-
-        if is_scalp and not scalp_ok:
-            logger.info(f"[{run_tag}] ⛔ Layer 1 blocked scalp — bias=NEUTRAL")
-            return
-
-        if not is_scalp and not swing_ok:
-            logger.info(f"[{run_tag}] ⛔ Layer 1 blocked swing")
-            return
-
-        logger.info(f"[{run_tag}] Layer 1 OK — bias={overall_bias}")
-    else:
-        logger.info(f"[{run_tag}] No L1 cache — proceeding without filter")
-
-    # ── Step 2: Session Filter (Scalp only) ──────────────────────
-    if is_scalp:
-        ok, reason = is_session_allowed(trade_type)
-        if not ok:
-            logger.info(f"[{run_tag}] 🕐 {reason}")
-            return
-        q_score = session_quality_score()
-        logger.info(f"[{run_tag}] Session OK — quality={q_score}")
-    else:
-        q_score = 1.0
-
-    # ── Step 3: Gemini Pre-Filter (Scalp only) ───────────────────
-    if is_scalp and Secrets.has_gemini():
-        try:
-            btc_price = await _fetcher.get_live_price("BTC/USDT:USDT")
-            eth_price = await _fetcher.get_live_price("ETH/USDT:USDT")
-            btc_1d    = await _fetcher.get_candles("BTC/USDT:USDT", "1d", 14)
-            eth_1d    = await _fetcher.get_candles("ETH/USDT:USDT", "1d", 14)
-            gm = await gemini_market_check(btc_price, eth_price,
-                                            btc_1d or [], eth_1d or [])
-            if not gm.get("ok"):
-                logger.info(f"[{run_tag}] 🤖 Gemini blocked scalp: {gm.get('reason')}")
-                return
-            logger.info(f"[{run_tag}] 🤖 Gemini: {gm.get('answer')} — {gm.get('reason')}")
-        except Exception as e:
-            logger.warning(f"[{run_tag}] Gemini pre-filter error: {e} — proceeding")
-
-    # ── Step 4: Fetch Data ────────────────────────────────────────
-    logger.info(f"[{run_tag}] Starting — session={session['name']} run_id={run_id}")
-    assets_data = await _fetcher.fetch_all_assets()
-
-    # Balance
-    balance = await _fetcher.get_balance()
-    if balance <= 0:
-        balance = 1000.0 if not Secrets.has_okx() else balance
-        if balance <= 0:
-            logger.warning(f"[{run_tag}] Balance=0 — skipping")
-            return
-
-    # Enrich asset data
-    try:
-        fear_greed = await _fetcher.get_fear_greed()
-    except Exception:
-        fear_greed = {}
-
-    for sym, d in assets_data.items():
-        if d:
-            d["fear_greed"]     = fear_greed
-            d["usdt_dominance"] = {}
-            d["trade_type"]     = trade_type
-            d["l1_context"]     = l1_ctx or {}
+    if notifier:
+        for u in result["updates"]:
+            msg = f"📊 <b>{u['symbol']}</b>\n🔔 {u['action']}"
             try:
-                d["funding"] = await _fetcher.get_funding_rate(sym)
-            except Exception:
-                d["funding"] = {}
+                await notifier.send(msg)
+            except Exception as e:
+                logger.warning(f"[Monitor] notify failed: {e}")
 
-    open_trades = _db.get_open_trades()
-    signals     = run_all_assets(assets_data, balance, open_trades, run_id)
-    logger.info(f"[{run_tag}] {len(signals)} raw signals generated")
 
-    if not signals:
-        logger.info(f"[{run_tag}] No signals this cycle")
+# ══════════════════════════════════════════════════════════════════
+# ✅ job_scalp — DEFINED DIRECTLY
+# ══════════════════════════════════════════════════════════════════
+async def job_scalp(notifier=None):
+    """Runs every 1h during London+NY sessions (07-16 UTC)."""
+    hour = datetime.now(timezone.utc).hour
+    if hour not in range(7, 17):
+        logger.info(f"[Scalp] Outside trading hours ({hour}:00 UTC)")
         return
 
-    # ── Step 5: Apply ATR Dynamic SL + Session Quality ───────────
-    enriched = []
-    for sig in signals:
-        symbol = sig.get("symbol","")
-        d      = assets_data.get(symbol, {})
-        c4h    = d.get("c4h") if d else None
+    balance    = await get_account_balance()
+    daily_pnl  = await get_daily_pnl()
+    open_count = len(await load_open_trades())
 
-        if c4h and len(c4h) >= 15:
-            price  = sig.get("entry", 0)
-            tt     = sig.get("trade_type", trade_type)
-            levels = calc_dynamic_sl_tp(
-                price=price,
-                direction=sig.get("direction","LONG"),
-                candles_4h=list(reversed(c4h)) if c4h else [],
-                trade_type=tt,
-            )
-            valid, reason = validate_levels(
-                price, sig.get("direction","LONG"),
-                levels["sl"], levels["tp1"],
-                min_rr=0.8,
-            )
-            if not valid:
-                logger.debug(f"[{run_tag}] {symbol} invalid levels: {reason}")
+    if daily_pnl < -DD_LIMIT_PCT:
+        logger.warning(f"[Scalp] Daily DD limit hit ({daily_pnl:.1f}%) — skipping")
+        return
+    if open_count >= MAX_OPEN * len(CRYPTO_SYMBOLS):
+        logger.info(f"[Scalp] Max open trades ({open_count}) reached — skipping")
+        return
+
+    logger.info(f"[Scalp] Balance=${balance:.2f} OpenTrades={open_count}")
+
+    for sym in CRYPTO_SYMBOLS:
+        sym_c = sym.replace("/USDT:USDT", "")
+        if await count_open_trades_for(sym) > 0:
+            continue
+        try:
+            sig = await generate_signal(sym)
+            if not sig:
                 continue
 
-            sig.update({
-                "sl":  levels["sl"],
-                "tp1": levels["tp1"],
-                "tp2": levels["tp2"],
-                "tp3": levels["tp3"],
-                "atr": levels["atr"],
-                "rr":  levels["rr"],
-            })
+            size_usdt = calc_size(balance, RISK_FRAC,
+                                   sig["entry_price"], sig["sl_dist"])
+            sig["size_usdt"]  = size_usdt
+            sig["risk_frac"]  = RISK_FRAC
+            sig["trade_type"] = "Scalp"
+            sig["run_id"]     = f"SCALP_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}"
 
-        # Boost score by session quality
-        sig["score"] = round(sig.get("score", 0) * q_score, 4)
-        enriched.append(sig)
+            if notifier:
+                msg = _build_signal_msg(sig)
+                try:
+                    tg_id = await notifier.send_get_id(msg)
+                    sig["tg_message_id"] = tg_id
+                except Exception as e:
+                    logger.warning(f"[Scalp] notify failed: {e}")
 
-    if not enriched:
-        logger.info(f"[{run_tag}] All signals filtered by ATR/RR check")
+            await save_trade(sig)
+            logger.info(
+                f"[Scalp] ✅ {sym_c} {sig['direction']} "
+                f"@ ${sig['entry_price']:.4f} RR={sig['rr']:.2f}"
+            )
+        except Exception as e:
+            logger.error(f"[Scalp] {sym_c}: {e}")
+
+    await save_account_balance(balance)
+
+
+# ══════════════════════════════════════════════════════════════════
+# ✅ job_swing — DEFINED DIRECTLY
+# ══════════════════════════════════════════════════════════════════
+async def job_swing(notifier=None):
+    """Runs every 4h. No session restriction."""
+    logger.info("[Swing] 🌊 Running swing analysis …")
+    balance   = await get_account_balance()
+    daily_pnl = await get_daily_pnl()
+    if daily_pnl < -DD_LIMIT_PCT:
+        logger.warning("[Swing] DD limit — skipping")
         return
 
-    # ── Step 6: AI Confirmation + Send ───────────────────────────
-    sent = 0
-    for sig in enriched:
-        try:
-            ai_ans = await confirm_signal(sig)
-        except Exception:
-            ai_ans = "SKIP"
-        sig["ai_confirmation"] = ai_ans
-
-        if ai_ans == "NO":
-            logger.info(f"[AI] Rejected: {sig['symbol']} {sig['direction']}")
+    for sym in CRYPTO_SYMBOLS:
+        sym_c = sym.replace("/USDT:USDT", "")
+        if await count_open_trades_for(sym) > 0:
             continue
-
-        # Telegram
         try:
-            await _notifier.send_signal(sig)
-            sent += 1
+            sig = await generate_signal(sym)
+            if not sig or sig.get("rr", 0) < 1.8:
+                continue
+
+            sig["trade_type"] = "Swing"
+            sig["risk_frac"]  = RISK_FRAC * 1.5
+            sig["run_id"]     = f"SWING_{datetime.now(timezone.utc).strftime('%Y%m%d%H')}"
+            sig["size_usdt"]  = calc_size(balance, sig["risk_frac"],
+                                           sig["entry_price"], sig["sl_dist"])
+            if notifier:
+                msg = _build_signal_msg(sig, trade_type="🌊 Swing")
+                try:
+                    tg_id = await notifier.send_get_id(msg)
+                    sig["tg_message_id"] = tg_id
+                except Exception as e:
+                    logger.warning(f"[Swing] notify failed: {e}")
+
+            await save_trade(sig)
+            logger.info(f"[Swing] ✅ {sym_c} {sig['direction']} RR={sig['rr']:.2f}")
         except Exception as e:
-            logger.error(f"[{run_tag}] Telegram: {e}")
-            continue
+            logger.error(f"[Swing] {sym_c}: {e}")
 
-        # DB: signal log
+
+# ══════════════════════════════════════════════════════════════════
+# ✅ job_daily — DEFINED DIRECTLY
+# ══════════════════════════════════════════════════════════════════
+async def job_daily(notifier=None):
+    """Daily summary report at 00:00 UTC."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    closed  = await _get("trades", f"status=eq.CLOSED&closed_at=gte.{today}")
+    open_t  = await load_open_trades()
+    balance = await get_account_balance()
+    macro   = await get_macro_context()
+
+    wins   = sum(1 for t in closed if t.get("result") == "WIN")
+    losses = sum(1 for t in closed if t.get("result") == "LOSS")
+    pnl    = sum(float(t.get("pnl_pct", 0) or 0) for t in closed)
+    wr     = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0
+
+    msg = (
+        f"📊 <b>Ramos 360 Ai — Daily Report</b>\n"
+        f"📅 {today}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 Balance:     ${balance:,.2f}\n"
+        f"📈 Today PnL:   {pnl:+.2f}%\n"
+        f"🎯 Win Rate:    {wr}% ({wins}W/{losses}L)\n"
+        f"📂 Open Trades: {len(open_t)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 USDT.D: {macro.get('usdt_d', '?')}% "
+        f"→ {macro.get('crypto_bias', '?')}\n"
+        f"₿ BTC.D:  {macro.get('btc_d', '?')}%\n"
+        f"<i>🎖️ Ramos 360 Ai</i>"
+    )
+    if notifier:
         try:
-            await _db.log_signal(sig)
+            await notifier.send(msg)
         except Exception as e:
-            logger.warning(f"[{run_tag}] log_signal: {e}")
+            logger.warning(f"[Daily] notify failed: {e}")
+    logger.info(f"[Daily] Report sent. PnL={pnl:+.2f}% WR={wr}%")
 
-        # DB: open trade
+
+# ══════════════════════════════════════════════════════════════════
+# ✅ job_weekly_report — DEFINED DIRECTLY
+# ══════════════════════════════════════════════════════════════════
+async def job_weekly_report(notifier=None):
+    week_start = (datetime.now(timezone.utc) - timedelta(days=7)).date().isoformat()
+    closed  = await _get("trades", f"status=eq.CLOSED&closed_at=gte.{week_start}")
+    balance = await get_account_balance()
+
+    wins   = sum(1 for t in closed if t.get("result") == "WIN")
+    losses = sum(1 for t in closed if t.get("result") == "LOSS")
+    pnl    = sum(float(t.get("pnl_pct", 0) or 0) for t in closed)
+    wr     = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0
+
+    msg = (
+        f"📅 <b>Ramos 360 Ai — Weekly Report</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 Balance:  ${balance:,.2f}\n"
+        f"📈 Week PnL: {pnl:+.2f}%\n"
+        f"🎯 Win Rate: {wr}% ({wins}W/{losses}L)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>🎖️ Ramos 360 Ai</i>"
+    )
+    if notifier:
         try:
-            await _db.log_trade({
-                "symbol":      sig["symbol"],
-                "direction":   sig["direction"],
-                "trade_type":  sig.get("trade_type", trade_type),
-                "status":      "OPEN",
-                "entry_price": sig["entry"],
-                "sl_price":    sig["sl"],
-                "tp1_price":   sig["tp1"],
-                "tp2_price":   sig["tp2"],
-                "tp3_price":   sig["tp3"],
-                "exit_price":  None,
-                "pnl_pct":     0,
-                "size_usdt":   sig.get("size_usdt"),
-                "run_id":      run_id,
-            })
+            await notifier.send(msg)
         except Exception as e:
-            logger.warning(f"[{run_tag}] log_trade: {e}")
-
-        await asyncio.sleep(0.5)
-
-    logger.info(f"[{run_tag}] ✅ Done — {sent}/{len(enriched)} sent")
+            logger.warning(f"[Weekly] notify failed: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
-# PUBLIC JOB FUNCTIONS
+# ✅ job_self_learn — DEFINED DIRECTLY
 # ══════════════════════════════════════════════════════════════════
-
-async def job_run_scalp():
-    """Layer 3: Session-filtered + Gemini-checked scalp."""
-    await _run_pipeline("SCALP", "Scalp")
-
-async def job_run_swing():
-    """Layer 2: Swing trading (no session restriction)."""
-    await _run_pipeline("SWING", "Swing")
-
-async def job_run_super_swing():
-    """Layer 2+: Super swing — no time/session restrictions."""
-    await _run_pipeline("SUPER_SWING", "SuperSwing")
-
-
-# ══════════════════════════════════════════════════════════════════
-# DAILY ANALYSIS (E10 + E11 + Layer 1)
-# ══════════════════════════════════════════════════════════════════
-async def job_daily_market():
-    logger.info("[Daily] 📊 Starting …")
-    try:
-        from engine.analysis_engine import run_full_analysis
-        await run_full_analysis(_db, _notifier, _fetcher)
-        # Also run Layer 1 at midnight
-        await run_layer1(_db)
-        await _db.heartbeat(CONFIG.VERSION, CONFIG.ASSETS)
-        logger.success("[Daily] ✅ Done")
-    except Exception as e:
-        logger.error(f"[Daily] {e}")
+async def job_self_learn(notifier=None):
+    logger.info("[SelfLearn] Not yet implemented in live engine — skipping")
+    if notifier:
         try:
-            await _notifier.send_error("DAILY", str(e))
+            await notifier.send("🧠 <b>Self Learn</b>\nقيد التطوير — سيُفعَّل قريباً.")
         except Exception:
             pass
 
 
 # ══════════════════════════════════════════════════════════════════
-# WEEKLY REPORT
+# ✅ job_layer1 — DEFINED DIRECTLY
 # ══════════════════════════════════════════════════════════════════
-async def job_weekly_report():
-    try:
-        open_t    = _db.get_open_trades()
-        daily_pnl = _db.get_daily_pnl()
-        msg = (
-            f"📋 <b>Weekly Report — {CONFIG.NAME}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📂 Trades open:  {len(open_t)}\n"
-            f"💰 Weekly PnL:   {daily_pnl:+.2f}%\n"
-            f"📊 Assets:       {len(CONFIG.ASSETS)}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>🎖️ {CONFIG.NAME}</i>"
-        )
-        await _notifier.send(msg)
-    except Exception as e:
-        logger.error(f"[Weekly] {e}")
-
-
-# ══════════════════════════════════════════════════════════════════
-# SELF LEARN
-# ══════════════════════════════════════════════════════════════════
-async def job_self_learn():
-    logger.info("[SelfLearn] 🧠 Starting …")
-    try:
-        from strategies import EXPERT_NAMES, EXPERT_WEIGHTS
-        closed = _db.get_closed_trades_last_week()
-        if not closed:
-            await _notifier.send(
-                "🧠 <b>Self Learn</b>\nلا توجد صفقات مغلقة هذا الأسبوع."
+async def job_layer1(notifier=None):
+    macro = await get_macro_context()
+    logger.info(f"[Layer1] USDT.D={macro.get('usdt_d')}% BTC.D={macro.get('btc_d')}%")
+    if notifier:
+        try:
+            await notifier.send(
+                f"🧠 <b>Layer 1 — Market Context</b>\n"
+                f"USDT.D: {macro.get('usdt_d','?')}%\n"
+                f"BTC.D: {macro.get('btc_d','?')}%\n"
+                f"Bias: {macro.get('crypto_bias','?')}"
             )
-            return
+        except Exception:
+            pass
 
-        scores = {n: {"w": 0, "l": 0} for n in EXPERT_NAMES}
-        for t in closed:
-            pnl  = float(t.get("pnl_pct", 0) or 0)
-            exps = t.get("experts_fired", []) or []
-            key  = "w" if pnl > 0 else "l"
-            for e in exps:
-                if e in scores: scores[e][key] += 1
 
-        weights   = list(EXPERT_WEIGHTS)
-        lines     = ["🧠 <b>Self Learn</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
-        for i, name in enumerate(EXPERT_NAMES):
-            s    = scores.get(name, {"w": 0, "l": 0})
-            tot  = s["w"] + s["l"]
-            if tot == 0: lines.append(f"  ➡️ {name}: no data"); continue
-            wr   = s["w"] / tot
-            old  = weights[i] if i < len(weights) else 1.0
-            if wr >= 0.60:   weights[i] = round(min(old*1.10, 2.5), 2); tag="⬆️"
-            elif wr <= 0.40: weights[i] = round(max(old*0.90, 0.3), 2); tag="⬇️"
-            else:            tag = "➡️"
-            lines.append(f"  {tag} {name}: {wr:.0%} ({s['w']}W/{s['l']}L) "
-                          f"{old}→{weights[i]}")
-
-        await _db.log_performance({"symbol":"SELF_LEARN",
-            "wins":  sum(s["w"] for s in scores.values()),
-            "losses":sum(s["l"] for s in scores.values()),
-            "total": len(closed),
-            "win_rate":0.0,"total_pnl":0.0,"max_dd":0.0})
-        await _notifier.send("\n".join(lines))
-        logger.success("[SelfLearn] ✅ Done")
-    except Exception as e:
-        logger.error(f"[SelfLearn] {e}")
-        try: await _notifier.send_error("SELF_LEARN", str(e))
-        except Exception: pass
+# ══════════════════════════════════════════════════════════════════
+# Legacy aliases (in case OTHER files reference old names)
+# ══════════════════════════════════════════════════════════════════
+job_monitor_positions = job_monitor
+job_run_scalp          = job_scalp
+job_run_swing          = job_swing
+job_run_super_swing    = job_swing
+job_daily_market       = job_daily
+job_run_layer1         = job_layer1
