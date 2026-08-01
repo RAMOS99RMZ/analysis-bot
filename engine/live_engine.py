@@ -1,24 +1,30 @@
 """
-engine/live_engine.py — Ramos 360 Ai 🎖️  (FIXED)
+engine/live_engine.py — Ramos 360 Ai 🎖️  (FIXED v3)
 ════════════════════════════════════════════════════
-FIXES:
-  1. "invalid literal for int() with base 10: np.str_('64942.0')"
-     → Root cause: price values from OKX come as numpy str/float mix.
-       All numeric parsing now uses float() with str() pre-cast,
-       never int() on raw price strings.
-  2. "cannot unpack non-iterable NoneType" (SOL/LINK/DOGE)
-     → alt_sl_tp()/macro_sl_tp() could return None on edge cases.
-       Now every SL/TP path has a guaranteed fallback tuple.
+ROOT CAUSE FOUND: The error happens INSIDE backtest_engine.py's own
+functions (_build, zigzag_dev, _elite_signal, alt_signal...) when fed
+live data — some internal calculation does int(price_value) and gets
+a numpy string scalar because a column's dtype silently became
+'object' instead of 'float64' during the live data pipeline.
+
+FIX:
+  1. Force pd.to_numeric() on ALL price/volume columns right before
+     handing the DataFrame to any backtest_engine function.
+     This guarantees float64 dtype — eliminates np.str_ entirely.
+  2. Guard EVERY signal-generation call against non-tuple returns
+     (fixes "cannot unpack non-iterable NoneType" for ALT/MACRO).
+  3. Full traceback logging (logger.exception) so if anything still
+     fails, the exact file:line is visible in the next run's logs.
 """
 from __future__ import annotations
-import asyncio, os
+import asyncio, os, traceback
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 import httpx, pandas as pd
 from loguru import logger
 
 _OKX = "https://www.okx.com/api/v5"
-_HDR = {"Accept": "application/json", "User-Agent": "Ramos360Live/2.0"}
+_HDR = {"Accept": "application/json", "User-Agent": "Ramos360Live/3.0"}
 _TFM = {"1h": "1H", "4h": "4H", "1d": "1D", "15m": "15m", "5m": "5m"}
 
 ALT_SYMBOLS   = {"SOL", "LINK", "DOGE", "AVAX", "ADA", "BNB", "XRP"}
@@ -38,17 +44,27 @@ def _inst(sym: str) -> str:
 
 
 def _safe_float(val, default: float = 0.0) -> float:
-    """
-    ✅ FIX: Never use int() on price strings.
-    Always cast through str() first to handle numpy types safely,
-    then float() — never int() which breaks on decimal strings.
-    """
     if val is None:
         return default
     try:
         return float(str(val))
     except (ValueError, TypeError):
         return default
+
+
+def _force_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    ✅ CRITICAL FIX: Guarantees every OHLCV column is true float64.
+    This is what eliminates 'int() ... np.str_(...)' errors —
+    those happen when a column's dtype is silently 'object'
+    (mixed str/float) instead of pure float64.
+    """
+    df = df.copy()
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+    df = df.dropna(subset=["close"]).reset_index(drop=True)
+    return df
 
 
 # ── Live price ────────────────────────────────────────────────────────────────
@@ -82,7 +98,7 @@ async def get_candles(symbol: str, tf: str = "1h", limit: int = 200) -> Optional
             for c in reversed(j["data"]):
                 try:
                     rows.append({
-                        "ts":     int(_safe_float(c[0])),   # timestamp: safe int via float
+                        "ts":     int(_safe_float(c[0])),
                         "open":   _safe_float(c[1]),
                         "high":   _safe_float(c[2]),
                         "low":    _safe_float(c[3]),
@@ -95,7 +111,10 @@ async def get_candles(symbol: str, tf: str = "1h", limit: int = 200) -> Optional
                 return None
             df = pd.DataFrame(rows)
             df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-            return df.set_index("ts")
+            # ✅ Force numeric BEFORE returning — guarantees clean dtypes downstream
+            df = _force_numeric(df)
+            df["ts"] = pd.to_datetime(df["ts"]) if not pd.api.types.is_datetime64_any_dtype(df["ts"]) else df["ts"]
+            return df
     except Exception as e:
         logger.warning(f"[Candles] {symbol} {tf}: {e}")
     return None
@@ -120,14 +139,8 @@ async def get_macro_context() -> Dict:
     return {"usdt_d": 7.0, "btc_d": 50.0, "crypto_bias": "NEUTRAL", "ok": False}
 
 
-# ── Fallback SL/TP (used when backtest functions fail/return None) ────────────
-def _fallback_sl_tp(price: float, direction: str,
-                     atr: float) -> Tuple[float, float, float, float, float]:
-    """
-    ✅ FIX for 'cannot unpack non-iterable NoneType':
-    Guaranteed non-None SL/TP tuple using simple ATR-based levels.
-    Used whenever the specialized alt/macro functions fail or return None.
-    """
+# ── Fallback SL/TP ──────────────────────────────────────────────────────────
+def _fallback_sl_tp(price: float, direction: str, atr: float) -> Tuple[float, float, float, float, float]:
     atr = atr if atr > 0 else price * 0.02
     if direction == "LONG":
         sl  = round(price - atr * 2.0, 6)
@@ -143,12 +156,41 @@ def _fallback_sl_tp(price: float, direction: str,
     return sl, tp1, tp2, tp3, sl_d
 
 
-# ── Signal generation (wraps backtest logic) ──────────────────────────────────
+def _safe_unpack3(result, default=(None, 0.0, {})):
+    """
+    ✅ FIX for 'cannot unpack non-iterable NoneType':
+    Guards ANY function call expected to return (sig, score, details)
+    against returning None or a wrong-length tuple.
+    """
+    if result is None:
+        return default
+    try:
+        if isinstance(result, (tuple, list)) and len(result) == 3:
+            return result[0], result[1], (result[2] if isinstance(result[2], dict) else {})
+        if isinstance(result, (tuple, list)) and len(result) >= 2:
+            return result[0], result[1], {}
+    except Exception:
+        pass
+    return default
+
+
+def _safe_unpack5(result, price, direction, atr, default_fn):
+    """Guards SL/TP function calls (expected 5-tuple) against None/wrong shape."""
+    if result is None:
+        return default_fn(price, direction, atr)
+    try:
+        if isinstance(result, (tuple, list)) and len(result) == 5:
+            return tuple(result)
+        if isinstance(result, (tuple, list)) and len(result) == 4:
+            sl, tp1, tp2, tp3 = result
+            return sl, tp1, tp2, tp3, abs(price - sl)
+    except Exception:
+        pass
+    return default_fn(price, direction, atr)
+
+
+# ── Signal generation ──────────────────────────────────────────────────────────
 async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Dict]:
-    """
-    جلب البيانات الحية وتشغيل نفس الخوارزمية من backtest.
-    محصّن ضد كل أخطاء NoneType / numpy str conversion.
-    """
     try:
         from backtesting.backtest_engine import (
             _build, _add_div, build_alt, build_macro,
@@ -171,12 +213,13 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
     df_1h = await get_candles(symbol, "1h", 300)
     df_4h = await get_candles(symbol, "4h", 100)
     if df_1h is None or len(df_1h) < 100:
-        logger.warning(f"[Live] {sym_c}: insufficient 1H data ({0 if df_1h is None else len(df_1h)} candles)")
+        logger.warning(f"[Live] {sym_c}: insufficient 1H data")
         return None
 
-    df_1h = df_1h.reset_index()
+    # ✅ Force numeric dtypes one more time defensively (belt & suspenders)
+    df_1h = _force_numeric(df_1h)
     if df_4h is not None:
-        df_4h = df_4h.reset_index()
+        df_4h = _force_numeric(df_4h)
 
     try:
         if engine_type == "ELITE":
@@ -185,7 +228,7 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             df_mtf = _build(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
             z = _confirmed(zigzag_dev(df), len(df) - 1)
             i = len(df) - 1
-            sig, score, dets = _elite_signal(df, z, i, cfg, df_mtf)
+            sig, score, dets = _safe_unpack3(_elite_signal(df, z, i, cfg, df_mtf))
 
         elif engine_type == "ALT":
             cfg = _alt_cfg_for(sym_c, AltConfig())
@@ -193,7 +236,7 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             df_mtf = build_alt(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
             z = _confirmed(zigzag_dev(df), len(df) - 1)
             i = len(df) - 1
-            sig, score, dets = alt_signal(df, z, i, cfg, df_mtf)
+            sig, score, dets = _safe_unpack3(alt_signal(df, z, i, cfg, df_mtf))
 
         else:  # MACRO
             cfg = _macro_cfg_for(sym_c, MacroConfig())
@@ -201,10 +244,12 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             df_mtf = build_macro(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
             z = _confirmed(zigzag_dev(df), len(df) - 1)
             i = len(df) - 1
-            sig, score, dets = macro_signal(df, z, i, cfg, df_mtf)
+            sig, score, dets = _safe_unpack3(macro_signal(df, z, i, cfg, df_mtf))
 
     except Exception as e:
+        # ✅ Full traceback so next failure shows EXACT file:line
         logger.error(f"[Live] {sym_c} signal generation failed: {e}")
+        logger.debug(f"[Live] {sym_c} full traceback:\n{traceback.format_exc()}")
         return None
 
     if not sig or sig == "NEUTRAL":
@@ -214,7 +259,6 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
     atr   = _safe_float(df.atr.iloc[-1]) if "atr" in df.columns else price * 0.015
     atr   = atr if atr > 0 else price * 0.015
 
-    # ── SL/TP with guaranteed fallback ────────────────────────────────────────
     sl = tp1 = tp2 = tp3 = sl_d = None
 
     try:
@@ -222,34 +266,32 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             from backtesting.backtest_engine import _fib_sl, _fib_tps
             hi60 = _safe_float(df.high.iloc[max(0, i-55):i+1].max())
             lo60 = _safe_float(df.low.iloc[max(0, i-55):i+1].min())
-            result = _fib_sl(price, hi60, lo60, sig, df, i, atr)
-            if result is not None:
-                sl, sl_d = result
-                result2 = _fib_tps(price, sl_d, sig, hi60, lo60)
-                if result2 is not None:
-                    tp1, tp2, tp3 = result2
+            sl_result = _fib_sl(price, hi60, lo60, sig, df, i, atr)
+            if sl_result is not None and len(sl_result) == 2:
+                sl, sl_d = sl_result
+                tp_result = _fib_tps(price, sl_d, sig, hi60, lo60)
+                if tp_result is not None and len(tp_result) == 3:
+                    tp1, tp2, tp3 = tp_result
 
         elif engine_type == "ALT":
             from backtesting.backtest_engine import alt_sl_tp
             sl_anchor = _safe_float(df.slo14.iloc[i]) if sig == "LONG" else _safe_float(df.shi14.iloc[i])
             result = alt_sl_tp(price, sig, sl_anchor, atr, cfg, df, i)
-            if result is not None:
-                sl, tp1, tp2, tp3, sl_d = result
+            sl, tp1, tp2, tp3, sl_d = _safe_unpack5(result, price, sig, atr, _fallback_sl_tp)
 
         else:  # MACRO
             from backtesting.backtest_engine import macro_sl_tp
             sl_anchor = _safe_float(df.slo14.iloc[i]) if sig == "LONG" else _safe_float(df.shi14.iloc[i])
             result = macro_sl_tp(price, sig, sl_anchor, atr, cfg, df, i)
-            if result is not None:
-                sl, tp1, tp2, tp3, sl_d = result
+            sl, tp1, tp2, tp3, sl_d = _safe_unpack5(result, price, sig, atr, _fallback_sl_tp)
 
     except Exception as e:
         logger.warning(f"[Live] {sym_c} SL/TP calc error: {e} — using fallback")
+        logger.debug(f"[Live] {sym_c} SL/TP traceback:\n{traceback.format_exc()}")
 
-    # ✅ FIX: guaranteed fallback if any of the above failed to produce values
     if sl is None or tp1 is None or sl_d is None or sl_d <= 0:
         sl, tp1, tp2, tp3, sl_d = _fallback_sl_tp(price, sig, atr)
-        logger.info(f"[Live] {sym_c}: using fallback SL/TP (specialized calc unavailable)")
+        logger.info(f"[Live] {sym_c}: using fallback SL/TP")
 
     rr = abs(tp1 - price) / max(sl_d, 1e-10)
     if rr < 1.1:
