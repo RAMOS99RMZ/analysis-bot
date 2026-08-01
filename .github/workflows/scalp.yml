@@ -26,5 +26,5 @@ jobs:
           OKX_PASS:     ${{ secrets.OKX_PASS }}
           GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
           GROQ_KEY:     ${{ secrets.GROQ_KEY }}
-          LOG_LEVEL:    "INFO"
+          LOG_LEVEL:    "DEBUG"
         run: timeout 480 python main.py --mode scalp || true
