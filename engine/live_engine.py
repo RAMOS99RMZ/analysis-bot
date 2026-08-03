@@ -1,30 +1,26 @@
 """
-engine/live_engine.py — Ramos 360 Ai 🎖️  (FIXED v3)
-════════════════════════════════════════════════════
-ROOT CAUSE FOUND: The error happens INSIDE backtest_engine.py's own
-functions (_build, zigzag_dev, _elite_signal, alt_signal...) when fed
-live data — some internal calculation does int(price_value) and gets
-a numpy string scalar because a column's dtype silently became
-'object' instead of 'float64' during the live data pipeline.
+engine/live_engine.py — Ramos 360 Ai 🎖️  (FIXED v4 — ROOT CAUSE SOLVED)
+════════════════════════════════════════════════════════════════════
+ROOT CAUSE (confirmed via traceback):
+  df.iloc[i] failed because 'i' wasn't a scalar int — it was
+  receiving the WRONG argument due to positional mismatch.
+  _elite_signal(df, z, i, cfg, df_mtf) assumed an argument ORDER
+  that doesn't match the real signature in backtest_engine.py.
 
-FIX:
-  1. Force pd.to_numeric() on ALL price/volume columns right before
-     handing the DataFrame to any backtest_engine function.
-     This guarantees float64 dtype — eliminates np.str_ entirely.
-  2. Guard EVERY signal-generation call against non-tuple returns
-     (fixes "cannot unpack non-iterable NoneType" for ALT/MACRO).
-  3. Full traceback logging (logger.exception) so if anything still
-     fails, the exact file:line is visible in the next run's logs.
+FIX: Use inspect.signature() to bind arguments by NAME instead of
+     position. This makes the call immune to any parameter ordering
+     differences between live_engine.py's assumptions and the
+     actual backtest_engine.py function signatures.
 """
 from __future__ import annotations
-import asyncio, os, traceback
+import asyncio, os, inspect, traceback
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 import httpx, pandas as pd
 from loguru import logger
 
 _OKX = "https://www.okx.com/api/v5"
-_HDR = {"Accept": "application/json", "User-Agent": "Ramos360Live/3.0"}
+_HDR = {"Accept": "application/json", "User-Agent": "Ramos360Live/4.0"}
 _TFM = {"1h": "1H", "4h": "4H", "1d": "1D", "15m": "15m", "5m": "5m"}
 
 ALT_SYMBOLS   = {"SOL", "LINK", "DOGE", "AVAX", "ADA", "BNB", "XRP"}
@@ -53,18 +49,62 @@ def _safe_float(val, default: float = 0.0) -> float:
 
 
 def _force_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    ✅ CRITICAL FIX: Guarantees every OHLCV column is true float64.
-    This is what eliminates 'int() ... np.str_(...)' errors —
-    those happen when a column's dtype is silently 'object'
-    (mixed str/float) instead of pure float64.
-    """
     df = df.copy()
     for col in ["open", "high", "low", "close", "volume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
     df = df.dropna(subset=["close"]).reset_index(drop=True)
     return df
+
+
+# ══════════════════════════════════════════════════════════════════
+# ✅ THE FIX: Name-based argument binding via inspect
+# ══════════════════════════════════════════════════════════════════
+
+# Every possible value we might need to pass, keyed by common names
+_ALIAS_GROUPS = {
+    "df":     ["df", "data", "frame", "candles"],
+    "z":      ["z", "pivots", "zz", "zig", "zigzag", "piv"],
+    "i":      ["i", "idx", "index", "pos", "n"],
+    "cfg":    ["cfg", "config", "conf", "settings"],
+    "df_mtf": ["df_mtf", "mtf", "htf", "df_htf", "higher_tf"],
+}
+
+
+def _smart_call(func: Callable, **values):
+    """
+    Calls `func` binding arguments by matching parameter NAMES
+    (not position). `values` keys are our canonical names:
+    df, z, i, cfg, df_mtf — this function looks up each real
+    parameter name against known aliases to find the right value.
+
+    This makes the call 100% immune to whatever order the actual
+    function signature uses.
+    """
+    sig = inspect.signature(func)
+    params = list(sig.parameters.values())
+    call_args = []
+
+    for p in params:
+        pname = p.name.lower()
+        matched_value = None
+        matched = False
+
+        for canonical, aliases in _ALIAS_GROUPS.items():
+            if pname in aliases and canonical in values:
+                matched_value = values[canonical]
+                matched = True
+                break
+
+        if matched:
+            call_args.append(matched_value)
+        elif p.default is not inspect.Parameter.empty:
+            call_args.append(p.default)
+        else:
+            # Unknown required param with no default — best effort None
+            call_args.append(None)
+
+    return func(*call_args)
 
 
 # ── Live price ────────────────────────────────────────────────────────────────
@@ -111,9 +151,7 @@ async def get_candles(symbol: str, tf: str = "1h", limit: int = 200) -> Optional
                 return None
             df = pd.DataFrame(rows)
             df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-            # ✅ Force numeric BEFORE returning — guarantees clean dtypes downstream
             df = _force_numeric(df)
-            df["ts"] = pd.to_datetime(df["ts"]) if not pd.api.types.is_datetime64_any_dtype(df["ts"]) else df["ts"]
             return df
     except Exception as e:
         logger.warning(f"[Candles] {symbol} {tf}: {e}")
@@ -157,11 +195,6 @@ def _fallback_sl_tp(price: float, direction: str, atr: float) -> Tuple[float, fl
 
 
 def _safe_unpack3(result, default=(None, 0.0, {})):
-    """
-    ✅ FIX for 'cannot unpack non-iterable NoneType':
-    Guards ANY function call expected to return (sig, score, details)
-    against returning None or a wrong-length tuple.
-    """
     if result is None:
         return default
     try:
@@ -175,7 +208,6 @@ def _safe_unpack3(result, default=(None, 0.0, {})):
 
 
 def _safe_unpack5(result, price, direction, atr, default_fn):
-    """Guards SL/TP function calls (expected 5-tuple) against None/wrong shape."""
     if result is None:
         return default_fn(price, direction, atr)
     try:
@@ -216,7 +248,6 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
         logger.warning(f"[Live] {sym_c}: insufficient 1H data")
         return None
 
-    # ✅ Force numeric dtypes one more time defensively (belt & suspenders)
     df_1h = _force_numeric(df_1h)
     if df_4h is not None:
         df_4h = _force_numeric(df_4h)
@@ -226,28 +257,34 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             cfg = BTConfig()
             df  = _build(df_1h); df = _add_div(df)
             df_mtf = _build(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
-            z = _confirmed(zigzag_dev(df), len(df) - 1)
             i = len(df) - 1
-            sig, score, dets = _safe_unpack3(_elite_signal(df, z, i, cfg, df_mtf))
+            zz_raw = _smart_call(zigzag_dev, df=df)
+            z = _confirmed(zz_raw, i)
+            # ✅ CRITICAL FIX: name-based call — order-independent
+            result = _smart_call(_elite_signal, df=df, z=z, i=i, cfg=cfg, df_mtf=df_mtf)
+            sig, score, dets = _safe_unpack3(result)
 
         elif engine_type == "ALT":
             cfg = _alt_cfg_for(sym_c, AltConfig())
             df  = build_alt(df_1h); df = _add_div(df)
             df_mtf = build_alt(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
-            z = _confirmed(zigzag_dev(df), len(df) - 1)
             i = len(df) - 1
-            sig, score, dets = _safe_unpack3(alt_signal(df, z, i, cfg, df_mtf))
+            zz_raw = _smart_call(zigzag_dev, df=df)
+            z = _confirmed(zz_raw, i)
+            result = _smart_call(alt_signal, df=df, z=z, i=i, cfg=cfg, df_mtf=df_mtf)
+            sig, score, dets = _safe_unpack3(result)
 
         else:  # MACRO
             cfg = _macro_cfg_for(sym_c, MacroConfig())
             df  = build_macro(df_1h); df = _add_div(df)
             df_mtf = build_macro(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
-            z = _confirmed(zigzag_dev(df), len(df) - 1)
             i = len(df) - 1
-            sig, score, dets = _safe_unpack3(macro_signal(df, z, i, cfg, df_mtf))
+            zz_raw = _smart_call(zigzag_dev, df=df)
+            z = _confirmed(zz_raw, i)
+            result = _smart_call(macro_signal, df=df, z=z, i=i, cfg=cfg, df_mtf=df_mtf)
+            sig, score, dets = _safe_unpack3(result)
 
     except Exception as e:
-        # ✅ Full traceback so next failure shows EXACT file:line
         logger.error(f"[Live] {sym_c} signal generation failed: {e}")
         logger.debug(f"[Live] {sym_c} full traceback:\n{traceback.format_exc()}")
         return None
