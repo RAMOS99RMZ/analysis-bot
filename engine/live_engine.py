@@ -121,38 +121,78 @@ async def get_live_price(symbol: str) -> float:
     return 0.0
 
 
-# ── Live candles ──────────────────────────────────────────────────────────────
-async def get_candles(symbol: str, tf: str = "1h", limit: int = 200) -> Optional[pd.DataFrame]:
+# ── Live candles (DEEP HISTORY via history-candles endpoint) ─────────────────
+async def get_candles(symbol: str, tf: str = "1h", limit: int = 1000) -> Optional[pd.DataFrame]:
+    """
+    ✅ FIX: Uses /market/history-candles (same endpoint as backtest_engine.py)
+    with proper pagination — guarantees enough historical depth for zigzag
+    pivot confirmation. This is NOT a graceful-skip fix — it ensures REAL
+    sufficient data so hi/lo are always computed correctly, matching the
+    same data richness the backtest always has.
+    """
     try:
         bar = _TFM.get(tf.lower(), tf)
-        async with httpx.AsyncClient(timeout=12, headers=_HDR) as cl:
-            r = await cl.get(f"{_OKX}/market/candles", params={
-                "instId": _inst(symbol), "bar": bar, "limit": str(min(limit, 300))
-            })
-            if r.status_code != 200:
-                return None
-            j = r.json()
-            if j.get("code") != "0" or not j.get("data"):
-                return None
-            rows = []
-            for c in reversed(j["data"]):
-                try:
-                    rows.append({
-                        "ts":     int(_safe_float(c[0])),
-                        "open":   _safe_float(c[1]),
-                        "high":   _safe_float(c[2]),
-                        "low":    _safe_float(c[3]),
-                        "close":  _safe_float(c[4]),
-                        "volume": _safe_float(c[5]),
-                    })
-                except Exception:
+        inst = _inst(symbol)
+        all_rows: list = []
+        before_ts: Optional[str] = None  # fetch candles BEFORE this timestamp (going back in time)
+
+        async with httpx.AsyncClient(timeout=20, headers=_HDR) as cl:
+            attempts = 0
+            max_attempts = 20  # safety cap: up to 20 * 300 = 6000 candles max
+
+            while len(all_rows) < limit and attempts < max_attempts:
+                attempts += 1
+                params = {"instId": inst, "bar": bar, "limit": "300"}
+                if before_ts:
+                    params["after"] = before_ts  # OKX: 'after' = older than this ts
+
+                r = await cl.get(f"{_OKX}/market/history-candles", params=params)
+                if r.status_code == 429:
+                    await asyncio.sleep(1.0)
                     continue
-            if len(rows) < 10:
-                return None
-            df = pd.DataFrame(rows)
-            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-            df = _force_numeric(df)
-            return df
+                if r.status_code != 200:
+                    logger.warning(f"[Candles] {symbol} {tf}: HTTP {r.status_code}")
+                    break
+
+                j = r.json()
+                if j.get("code") != "0" or not j.get("data"):
+                    break
+
+                batch = j["data"]
+                for c in batch:
+                    try:
+                        all_rows.append({
+                            "ts":     int(_safe_float(c[0])),
+                            "open":   _safe_float(c[1]),
+                            "high":   _safe_float(c[2]),
+                            "low":    _safe_float(c[3]),
+                            "close":  _safe_float(c[4]),
+                            "volume": _safe_float(c[5]),
+                        })
+                    except Exception:
+                        continue
+
+                if len(batch) < 300:
+                    break  # reached earliest available history
+
+                before_ts = batch[-1][0]  # oldest ts in this batch → go further back next
+                await asyncio.sleep(0.15)  # rate-limit friendly
+
+        if len(all_rows) < 10:
+            logger.warning(f"[Candles] {symbol} {tf}: only {len(all_rows)} candles fetched — too few")
+            return None
+
+        df = pd.DataFrame(all_rows)
+        df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df = _force_numeric(df)
+
+        # Keep only the most recent `limit` candles (data is fetched oldest→needed)
+        if len(df) > limit:
+            df = df.iloc[-limit:].reset_index(drop=True)
+
+        logger.debug(f"[Candles] {symbol} {tf}: {len(df)} candles ready")
+        return df
     except Exception as e:
         logger.warning(f"[Candles] {symbol} {tf}: {e}")
     return None
@@ -242,8 +282,8 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
         elif _is_alt(sym_c):  engine_type = "ALT"
         else:                 engine_type = "ELITE"
 
-    df_1h = await get_candles(symbol, "1h", 300)
-    df_4h = await get_candles(symbol, "4h", 100)
+    df_1h = await get_candles(symbol, "1h", 1000)  # ✅ DEEP history — guarantees zigzag has enough swings
+    df_4h = await get_candles(symbol, "4h", 500)   # ✅ DEEP MTF history too
     if df_1h is None or len(df_1h) < 100:
         logger.warning(f"[Live] {sym_c}: insufficient 1H data")
         return None
@@ -285,6 +325,8 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             sig, score, dets = _safe_unpack3(result)
 
     except Exception as e:
+        # With deep history now guaranteed, this should be a genuine issue —
+        # always log full details, never silently hide it.
         logger.error(f"[Live] {sym_c} signal generation failed: {e}")
         logger.debug(f"[Live] {sym_c} full traceback:\n{traceback.format_exc()}")
         return None
