@@ -298,10 +298,14 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             df  = _build(df_1h); df = _add_div(df)
             df_mtf = _build(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
             i = len(df) - 1
-            zz_raw = _smart_call(zigzag_dev, df=df)
-            z = _confirmed(zz_raw, i)
-            # ✅ CRITICAL FIX: name-based call — order-independent
-            result = _smart_call(_elite_signal, df=df, z=z, i=i, cfg=cfg, df_mtf=df_mtf)
+            # ✅ REAL FIX: _elite_signal's true signature is
+            #    (df, i, hi, lo, cfg, df_mtf=...) — hi/lo are the
+            #    swing high/low over cfg.swing_lookback candles,
+            #    computed EXACTLY like backtest_engine.py's own _sim() does.
+            lb    = getattr(cfg, "swing_lookback", 50)
+            hi_sw = float(df.high.iloc[max(0, i - lb):i + 1].max())
+            lo_sw = float(df.low.iloc[max(0, i - lb):i + 1].min())
+            result = _elite_signal(df, i, hi_sw, lo_sw, cfg, df_mtf=df_mtf)
             sig, score, dets = _safe_unpack3(result)
 
         elif engine_type == "ALT":
@@ -309,9 +313,14 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             df  = build_alt(df_1h); df = _add_div(df)
             df_mtf = build_alt(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
             i = len(df) - 1
-            zz_raw = _smart_call(zigzag_dev, df=df)
-            z = _confirmed(zz_raw, i)
-            result = _smart_call(alt_signal, df=df, z=z, i=i, cfg=cfg, df_mtf=df_mtf)
+            # ✅ REAL FIX (verified against source): alt_signal(df, z, i, cfg, df_mtf)
+            #    z = confirmed zigzag pivots, computed EXACTLY like backtest's _sim():
+            #       piv_all = zigzag_dev(df, cfg.zz_atr)
+            #       z = _confirmed(piv_all, i)
+            zz_atr  = getattr(cfg, "zz_atr", 2.2)
+            piv_all = zigzag_dev(df, zz_atr)
+            z       = _confirmed(piv_all, i)
+            result  = alt_signal(df, z, i, cfg, df_mtf=df_mtf)
             sig, score, dets = _safe_unpack3(result)
 
         else:  # MACRO
@@ -319,9 +328,11 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             df  = build_macro(df_1h); df = _add_div(df)
             df_mtf = build_macro(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
             i = len(df) - 1
-            zz_raw = _smart_call(zigzag_dev, df=df)
-            z = _confirmed(zz_raw, i)
-            result = _smart_call(macro_signal, df=df, z=z, i=i, cfg=cfg, df_mtf=df_mtf)
+            # ✅ REAL FIX (verified against source): macro_signal(df, z, i, cfg, df_mtf)
+            zz_atr  = getattr(cfg, "zz_atr", 2.2)
+            piv_all = zigzag_dev(df, zz_atr)
+            z       = _confirmed(piv_all, i)
+            result  = macro_signal(df, z, i, cfg, df_mtf=df_mtf)
             sig, score, dets = _safe_unpack3(result)
 
     except Exception as e:
