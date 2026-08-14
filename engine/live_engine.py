@@ -269,7 +269,7 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             _elite_signal, alt_signal, macro_signal,
             BTConfig, AltConfig, MacroConfig,
             _alt_cfg_for, _macro_cfg_for, zigzag_dev,
-            _confirmed,
+            _confirmed, _regime,   # ✅ _regime imported for diagnostics only
         )
     except ImportError as e:
         logger.error(f"[Live] Cannot import backtest_engine functions: {e}")
@@ -305,6 +305,25 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             lb    = getattr(cfg, "swing_lookback", 50)
             hi_sw = float(df.high.iloc[max(0, i - lb):i + 1].max())
             lo_sw = float(df.low.iloc[max(0, i - lb):i + 1].min())
+            # ✅ DIAGNOSTIC: replicate the internal _regime() check to see
+            # EXACTLY why _elite_signal returns NEUTRAL (same call it makes
+            # internally — read-only, does not affect the real decision).
+            try:
+                diag_regime, diag_reg_sc = _regime(df, i, cfg)
+                diag_adx = _safe_float(df.adx.iloc[i]) if "adx" in df.columns else -1
+                diag_e20 = _safe_float(df.e20.iloc[i])  if "e20"  in df.columns else -1
+                diag_e50 = _safe_float(df.e50.iloc[i])  if "e50"  in df.columns else -1
+                diag_e200= _safe_float(df.e200.iloc[i]) if "e200" in df.columns else -1
+                logger.info(
+                    f"[Diag] {sym_c} regime={diag_regime} reg_sc={diag_reg_sc} "
+                    f"adx={diag_adx:.1f}(min={getattr(cfg,'adx_trend_min','?')}) "
+                    f"price={_safe_float(df.close.iloc[i]):.2f} "
+                    f"e20={diag_e20:.2f} e50={diag_e50:.2f} e200={diag_e200:.2f} "
+                    f"hi_sw={hi_sw:.2f} lo_sw={lo_sw:.2f}"
+                )
+            except Exception as diag_e:
+                logger.debug(f"[Diag] {sym_c} diagnostic call failed: {diag_e}")
+
             result = _elite_signal(df, i, hi_sw, lo_sw, cfg, df_mtf=df_mtf)
             sig, score, dets = _safe_unpack3(result)
 
