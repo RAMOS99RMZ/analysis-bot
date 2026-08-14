@@ -108,11 +108,14 @@ async def job_scalp(notifier=None):
 
     for sym in CRYPTO_SYMBOLS:
         sym_c = sym.replace("/USDT:USDT", "")
-        if await count_open_trades_for(sym) > 0:
+        open_ct = await count_open_trades_for(sym)
+        if open_ct > 0:
+            logger.info(f"[Scalp] {sym_c}: already has {open_ct} open trade(s) — skipping")
             continue
         try:
             sig = await generate_signal(sym)
             if not sig:
+                logger.info(f"[Scalp] {sym_c}: no actionable signal this cycle")
                 continue
 
             size_usdt = calc_size(balance, RISK_FRAC,
@@ -139,6 +142,7 @@ async def job_scalp(notifier=None):
             logger.error(f"[Scalp] {sym_c}: {e}")
 
     await save_account_balance(balance)
+    logger.info(f"[Scalp] ✅ Cycle complete — checked {len(CRYPTO_SYMBOLS)} symbols")
 
 
 # ══════════════════════════════════════════════════════════════════
