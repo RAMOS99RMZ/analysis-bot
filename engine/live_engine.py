@@ -342,6 +342,16 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
         logger.debug(f"[Live] {sym_c} full traceback:\n{traceback.format_exc()}")
         return None
 
+    # ✅ DIAGNOSTIC: always log the outcome, even when NEUTRAL,
+    # so we can see EXACTLY why no trade was generated per symbol.
+    votes_info = ""
+    if isinstance(dets, dict) and dets:
+        votes_info = " | " + " ".join(f"{k}={v}" for k, v in list(dets.items())[:4])
+    logger.info(
+        f"[Live] {sym_c} [{engine_type}] → sig={sig or 'NEUTRAL'} "
+        f"score={_safe_float(score):.3f}{votes_info}"
+    )
+
     if not sig or sig == "NEUTRAL":
         return None
 
