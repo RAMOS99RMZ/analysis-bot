@@ -297,62 +297,85 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
             cfg = BTConfig()
             df  = _build(df_1h); df = _add_div(df)
             df_mtf = _build(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
-            i = len(df) - 1
-            # ✅ REAL FIX: _elite_signal's true signature is
-            #    (df, i, hi, lo, cfg, df_mtf=...) — hi/lo are the
-            #    swing high/low over cfg.swing_lookback candles,
-            #    computed EXACTLY like backtest_engine.py's own _sim() does.
-            lb    = getattr(cfg, "swing_lookback", 50)
-            hi_sw = float(df.high.iloc[max(0, i - lb):i + 1].max())
-            lo_sw = float(df.low.iloc[max(0, i - lb):i + 1].min())
-            # ✅ DIAGNOSTIC: replicate the internal _regime() check to see
-            # EXACTLY why _elite_signal returns NEUTRAL (same call it makes
-            # internally — read-only, does not affect the real decision).
+            last_i = len(df) - 1
+            lb     = getattr(cfg, "swing_lookback", 50)
+
+            # ✅ SAFE FREQUENCY BOOST: scan the last 3 candles instead of
+            # only the very latest one. SAME exact thresholds/logic as
+            # backtest (zero quality change) — just a wider TIME window
+            # so a valid setup from 1-2 hours ago isn't missed if it's
+            # still fresh. Most recent valid signal wins.
+            sig, score, dets, i = None, 0.0, {}, last_i
+            for candle_offset in range(0, 3):
+                ci = last_i - candle_offset
+                if ci < lb + 5:
+                    break
+                c_hi = float(df.high.iloc[max(0, ci - lb):ci + 1].max())
+                c_lo = float(df.low.iloc[max(0, ci - lb):ci + 1].min())
+                c_result = _elite_signal(df, ci, c_hi, c_lo, cfg, df_mtf=df_mtf)
+                c_sig, c_score, c_dets = _safe_unpack3(c_result)
+                if c_sig and c_sig != "NEUTRAL":
+                    sig, score, dets, i = c_sig, c_score, c_dets, ci
+                    hi_sw, lo_sw = c_hi, c_lo
+                    break
+            else:
+                hi_sw = float(df.high.iloc[max(0, last_i - lb):last_i + 1].max())
+                lo_sw = float(df.low.iloc[max(0, last_i - lb):last_i + 1].min())
+
+            # ✅ DIAGNOSTIC: always show regime at the LATEST candle for visibility
             try:
-                diag_regime, diag_reg_sc = _regime(df, i, cfg)
-                diag_adx = _safe_float(df.adx.iloc[i]) if "adx" in df.columns else -1
-                diag_e20 = _safe_float(df.e20.iloc[i])  if "e20"  in df.columns else -1
-                diag_e50 = _safe_float(df.e50.iloc[i])  if "e50"  in df.columns else -1
-                diag_e200= _safe_float(df.e200.iloc[i]) if "e200" in df.columns else -1
+                diag_regime, diag_reg_sc = _regime(df, last_i, cfg)
+                diag_adx = _safe_float(df.adx.iloc[last_i]) if "adx" in df.columns else -1
                 logger.info(
                     f"[Diag] {sym_c} regime={diag_regime} reg_sc={diag_reg_sc} "
                     f"adx={diag_adx:.1f}(min={getattr(cfg,'adx_trend_min','?')}) "
-                    f"price={_safe_float(df.close.iloc[i]):.2f} "
-                    f"e20={diag_e20:.2f} e50={diag_e50:.2f} e200={diag_e200:.2f} "
-                    f"hi_sw={hi_sw:.2f} lo_sw={lo_sw:.2f}"
+                    f"price={_safe_float(df.close.iloc[last_i]):.2f} "
+                    f"scanned_candles=3 found_at_offset={last_i - i}"
                 )
             except Exception as diag_e:
                 logger.debug(f"[Diag] {sym_c} diagnostic call failed: {diag_e}")
-
-            result = _elite_signal(df, i, hi_sw, lo_sw, cfg, df_mtf=df_mtf)
-            sig, score, dets = _safe_unpack3(result)
 
         elif engine_type == "ALT":
             cfg = _alt_cfg_for(sym_c, AltConfig())
             df  = build_alt(df_1h); df = _add_div(df)
             df_mtf = build_alt(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
-            i = len(df) - 1
-            # ✅ REAL FIX (verified against source): alt_signal(df, z, i, cfg, df_mtf)
-            #    z = confirmed zigzag pivots, computed EXACTLY like backtest's _sim():
-            #       piv_all = zigzag_dev(df, cfg.zz_atr)
-            #       z = _confirmed(piv_all, i)
+            last_i  = len(df) - 1
             zz_atr  = getattr(cfg, "zz_atr", 2.2)
             piv_all = zigzag_dev(df, zz_atr)
-            z       = _confirmed(piv_all, i)
-            result  = alt_signal(df, z, i, cfg, df_mtf=df_mtf)
-            sig, score, dets = _safe_unpack3(result)
+
+            # ✅ SAFE FREQUENCY BOOST: same 3-candle scan, same exact
+            # alt_signal() logic/thresholds — zero quality change.
+            sig, score, dets, i = None, 0.0, {}, last_i
+            for candle_offset in range(0, 3):
+                ci = last_i - candle_offset
+                if ci < 20:
+                    break
+                c_z = _confirmed(piv_all, ci)
+                c_result = alt_signal(df, c_z, ci, cfg, df_mtf=df_mtf)
+                c_sig, c_score, c_dets = _safe_unpack3(c_result)
+                if c_sig and c_sig != "NEUTRAL":
+                    sig, score, dets, i = c_sig, c_score, c_dets, ci
+                    break
 
         else:  # MACRO
             cfg = _macro_cfg_for(sym_c, MacroConfig())
             df  = build_macro(df_1h); df = _add_div(df)
             df_mtf = build_macro(df_4h) if df_4h is not None and len(df_4h) >= 30 else None
-            i = len(df) - 1
-            # ✅ REAL FIX (verified against source): macro_signal(df, z, i, cfg, df_mtf)
+            last_i  = len(df) - 1
             zz_atr  = getattr(cfg, "zz_atr", 2.2)
             piv_all = zigzag_dev(df, zz_atr)
-            z       = _confirmed(piv_all, i)
-            result  = macro_signal(df, z, i, cfg, df_mtf=df_mtf)
-            sig, score, dets = _safe_unpack3(result)
+
+            sig, score, dets, i = None, 0.0, {}, last_i
+            for candle_offset in range(0, 3):
+                ci = last_i - candle_offset
+                if ci < 20:
+                    break
+                c_z = _confirmed(piv_all, ci)
+                c_result = macro_signal(df, c_z, ci, cfg, df_mtf=df_mtf)
+                c_sig, c_score, c_dets = _safe_unpack3(c_result)
+                if c_sig and c_sig != "NEUTRAL":
+                    sig, score, dets, i = c_sig, c_score, c_dets, ci
+                    break
 
     except Exception as e:
         # With deep history now guaranteed, this should be a genuine issue —
@@ -383,9 +406,13 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
     try:
         if engine_type == "ELITE":
             from backtesting.backtest_engine import _fib_sl, _fib_tps
-            hi60 = _safe_float(df.high.iloc[max(0, i-55):i+1].max())
-            lo60 = _safe_float(df.low.iloc[max(0, i-55):i+1].min())
-            sl_result = _fib_sl(price, hi60, lo60, sig, df, i, atr)
+            # ✅ CONSISTENCY FIX: use last_i (current candle) for SL/TP range,
+            # not the (possibly older) candle 'i' where the signal was first
+            # confirmed. Entry price is always current — SL/TP structure
+            # should reflect current market state too, not stale history.
+            hi60 = _safe_float(df.high.iloc[max(0, last_i-55):last_i+1].max())
+            lo60 = _safe_float(df.low.iloc[max(0, last_i-55):last_i+1].min())
+            sl_result = _fib_sl(price, hi60, lo60, sig, df, i, atr, cfg)   # ✅ FIXED: cfg was missing
             if sl_result is not None and len(sl_result) == 2:
                 sl, sl_d = sl_result
                 tp_result = _fib_tps(price, sl_d, sig, hi60, lo60)
@@ -394,13 +421,13 @@ async def generate_signal(symbol: str, engine_type: str = "auto") -> Optional[Di
 
         elif engine_type == "ALT":
             from backtesting.backtest_engine import alt_sl_tp
-            sl_anchor = _safe_float(df.slo14.iloc[i]) if sig == "LONG" else _safe_float(df.shi14.iloc[i])
+            sl_anchor = _safe_float(df.slo14.iloc[last_i]) if sig == "LONG" else _safe_float(df.shi14.iloc[last_i])  # ✅ consistent: current structure
             result = alt_sl_tp(price, sig, sl_anchor, atr, cfg, df, i)
             sl, tp1, tp2, tp3, sl_d = _safe_unpack5(result, price, sig, atr, _fallback_sl_tp)
 
         else:  # MACRO
             from backtesting.backtest_engine import macro_sl_tp
-            sl_anchor = _safe_float(df.slo14.iloc[i]) if sig == "LONG" else _safe_float(df.shi14.iloc[i])
+            sl_anchor = _safe_float(df.slo14.iloc[last_i]) if sig == "LONG" else _safe_float(df.shi14.iloc[last_i])  # ✅ consistent: current structure
             result = macro_sl_tp(price, sig, sl_anchor, atr, cfg, df, i)
             sl, tp1, tp2, tp3, sl_d = _safe_unpack5(result, price, sig, atr, _fallback_sl_tp)
 
