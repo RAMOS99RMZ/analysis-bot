@@ -89,7 +89,9 @@ async def _patch(table: str, filters: str, data: Dict) -> bool:
 # ══════════════════════════════════════════════════════════════════
 
 async def load_open_trades() -> List[Dict]:
-    rows = await _get("trades", "status=eq.OPEN&order=created_at.asc&limit=100")
+    # ✅ CRITICAL FIX: was "status=eq.OPEN" only — PARTIAL trades (after TP1)
+    # became invisible to monitor forever. Now includes OPEN + PARTIAL.
+    rows = await _get("trades", "status=neq.CLOSED&order=created_at.asc&limit=100")
     logger.info(f"[State] Loaded {len(rows)} open trades from Supabase")
     return rows
 
@@ -276,7 +278,7 @@ async def get_daily_pnl() -> float:
 
 async def count_open_trades_for(symbol: str = None) -> int:
     if symbol:
-        rows = await _get("trades", f"status=eq.OPEN&symbol=eq.{symbol}")
+        rows = await _get("trades", f"status=neq.CLOSED&symbol=eq.{symbol}")   # ✅ same fix
     else:
-        rows = await _get("trades", "status=eq.OPEN")
+        rows = await _get("trades", "status=neq.CLOSED")   # ✅ same fix
     return len(rows)
